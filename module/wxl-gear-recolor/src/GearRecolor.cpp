@@ -59,6 +59,7 @@ namespace
     };
 
 
+
     std::mutex g_colorMutex;
     SlotHsl g_slotHsl[kMaxEquipSlots];
 
@@ -1379,35 +1380,44 @@ namespace
         SaveHslToDisk();
     }
 
-    // OC mesh: same luminance * RGB colorize as body CPU path.
-    // c0.rgb = picked color, c0.a unused.
+    // OC mesh: luminance * picked RGB, then * vertex diffuse so character
+    // lighting / near-camera fade stay (body textures keep lighting because
+    // tint happens before the engine light pass; our EQUAL redraw must not
+    // discard COLOR0).
     constexpr char kHslPsHlsl[] = R"(
 sampler2D s0 : register(s0);
 float4 c0 : register(c0);
 
-float4 main(float2 uv : TEXCOORD0) : COLOR0
+float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
 {
     float4 t = tex2D(s0, uv);
     float lum = dot(t.rgb, float3(0.299, 0.587, 0.114));
-    float3 outRgb = saturate(lum * c0.rgb);
-    return float4(outRgb, t.a);
+    float3 colored = saturate(lum * c0.rgb);
+    float3 outRgb = saturate(colored * diff.rgb);
+    return float4(outRgb, saturate(t.a * diff.a));
 }
 )";
 
     IDirect3DPixelShader9* EnsureHslPs(void* deviceRaw)
     {
         static IDirect3DPixelShader9* ps = nullptr;
-        static bool tried = false;
-        if (tried)
+        static int compiledVer = 0;
+        constexpr int kPsVer = 2; // v2: multiply vertex diffuse (lighting/fade)
+        if (compiledVer == kPsVer)
             return ps;
-        tried = true;
+        compiledVer = kPsVer;
+        if (ps)
+        {
+            ps->Release();
+            ps = nullptr;
+        }
         ps = static_cast<IDirect3DPixelShader9*>(
             gx::CompilePixelShader(gx::Device9(deviceRaw), kHslPsHlsl, "ps_2_0"));
         g_hslPsState.store(ps ? 1 : 0, std::memory_order_relaxed);
         if (ps)
-            WLOG_INFO("gear-recolor: YIQ hue PS ready (all slots)");
+            WLOG_INFO("gear-recolor: OC colorize PS v%d ready (diffuse lit)", kPsVer);
         else
-            WLOG_WARN("gear-recolor: YIQ PS compile failed; FF fallback");
+            WLOG_WARN("gear-recolor: OC PS compile failed; FF fallback");
         return ps;
     }
 
