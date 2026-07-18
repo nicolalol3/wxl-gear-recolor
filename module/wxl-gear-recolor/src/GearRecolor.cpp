@@ -2,10 +2,14 @@
 // Copyright (C) 2026. GPLv3 (see WarcraftXL LICENSE).
 //
 // Lua API:
-//   WXL_RecolorSetSlot(slot, r, g, b)   rgb 0..1
-//   WXL_RecolorGetSlot(slot) -> r, g, b, active
-//   WXL_RecolorClearSlot / WXL_RecolorClearAll
-// State file: slot r g b  (legacy HSL rows with values >1 are ignored)
+//   WXL_RecolorSetSlot(slot, r, g, b)   solid rgb 0..1
+//   WXL_RecolorSetSlotSelective(slot, sr,sg,sb, dr,dg,db, tol [, forceAppend])
+//   WXL_RecolorGetSlot(slot) -> r,g,b,active,mode,sr,sg,sb,tol,ruleCount
+//   WXL_RecolorBeginBatch / WXL_RecolorEndBatch([forceRebuild])
+//   WXL_RecolorFlushTex()  — logout / leave-world TextureCache reset
+//   WXL_RecolorForceBodyRebuild / WXL_RecolorClearSlot / WXL_RecolorClearAll
+//   WXL_RecolorArmScreenSample / GetScreenSample / CancelScreenSample
+// State file: slot mode ...  (legacy "slot r g b" still loads as solid)
 
 #include "core/Logger.hpp"
 #include "core/Hook.hpp"
@@ -49,21 +53,53 @@ namespace
     constexpr size_t kOffComponentFlags = 0x3C;
     constexpr uint32_t kComponentFlagNpc = 0x1;
 
-    // Fields named hue/sat/light for legacy call sites; values are RGB 0..1.
+    // Fields named hue/sat/light for legacy call sites; values are RGB 0..1 (solid dest).
+    // mode 0 = solid (lum * dest), mode 1 = selective (chained src→dst rules).
+    constexpr int kMaxSelRules = 4;
+    struct SelRule
+    {
+        float sr = 0.8f, sg = 0.2f, sb = 0.2f;
+        float dr = 0.2f, dg = 0.4f, db = 0.9f;
+        float tol = 0.35f;
+    };
     struct SlotHsl
     {
         bool active = false;
-        float hue = 1.f;   // R
-        float sat = 1.f;   // G
-        float light = 1.f; // B
+        uint8_t mode = 0; // 0 solid, 1 selective
+        float hue = 1.f;   // solid dest R (also mirrors last selective dest)
+        float sat = 1.f;
+        float light = 1.f;
+        float srcR = 0.8f; // mirrors last selective src (GetSlot / UI)
+        float srcG = 0.2f;
+        float srcB = 0.2f;
+        float tolerance = 0.35f;
+        SelRule rules[kMaxSelRules] = {};
+        uint8_t ruleCount = 0;
     };
 
+    void SyncSlotMirrorsFromLastRule(SlotHsl& h)
+    {
+        if (h.ruleCount == 0)
+            return;
+        const SelRule& r = h.rules[h.ruleCount - 1];
+        h.srcR = r.sr;
+        h.srcG = r.sg;
+        h.srcB = r.sb;
+        h.hue = r.dr;
+        h.sat = r.dg;
+        h.light = r.db;
+        h.tolerance = r.tol;
+    }
 
+    bool SrcNear(float a, float b)
+    {
+        return std::fabs(a - b) < 0.045f;
+    }
 
-    std::mutex g_colorMutex;
-    SlotHsl g_slotHsl[kMaxEquipSlots];
-
-    constexpr char kStateFile[] = "WarcraftXL_gear-recolor.state";
+    bool SameSelectiveSrc(const SelRule& r, float sr, float sg, float sb)
+    {
+        return SrcNear(r.sr, sr) && SrcNear(r.sg, sg) && SrcNear(r.sb, sb);
+    }
 
     float Clamp01(float v)
     {
@@ -73,6 +109,12 @@ namespace
             return 1.f;
         return v;
     }
+
+
+    std::mutex g_colorMutex;
+    SlotHsl g_slotHsl[kMaxEquipSlots];
+
+    constexpr char kStateFile[] = "WarcraftXL_gear-recolor.state";
 
     bool IsIdentityHsl(const SlotHsl& h)
     {
@@ -86,14 +128,203 @@ namespace
     }
 
     // Colorize: keep luminance (shading), apply picked RGB as chroma.
+    void RgbToHsv(float r, float g, float b, float& h, float& s, float& v)
+    {
+        const float mx = (std::max)(r, (std::max)(g, b));
+        const float mn = (std::min)(r, (std::min)(g, b));
+        const float d = mx - mn;
+        v = mx;
+        s = (mx > 1e-6f) ? (d / mx) : 0.f;
+        if (d < 1e-6f)
+        {
+            h = 0.f;
+            return;
+        }
+        if (mx == r)
+            h = (g - b) / d + (g < b ? 6.f : 0.f);
+        else if (mx == g)
+            h = (b - r) / d + 2.f;
+        else
+            h = (r - g) / d + 4.f;
+        h *= (1.f / 6.f);
+    }
+
+    void HsvToRgb(float h, float s, float v, float& r, float& g, float& b)
+    {
+        if (s <= 1e-6f)
+        {
+            r = g = b = v;
+            return;
+        }
+        h = h - std::floor(h);
+        const float i = std::floor(h * 6.f);
+        const float f = h * 6.f - i;
+        const float p = v * (1.f - s);
+        const float q = v * (1.f - f * s);
+        const float t = v * (1.f - (1.f - f) * s);
+        switch (static_cast<int>(i) % 6)
+        {
+        case 0: r = v; g = t; b = p; break;
+        case 1: r = q; g = v; b = p; break;
+        case 2: r = p; g = v; b = t; break;
+        case 3: r = p; g = q; b = v; break;
+        case 4: r = t; g = p; b = v; break;
+        default: r = v; g = p; b = q; break;
+        }
+    }
+
+    float HueDistance(float a, float b)
+    {
+        float d = std::fabs(a - b);
+        if (d > 0.5f)
+            d = 1.f - d;
+        return d;
+    }
+
+    float Smoothstep01(float edge0, float edge1, float x)
+    {
+        if (edge1 <= edge0)
+            return x >= edge1 ? 1.f : 0.f;
+        const float t = Clamp01((x - edge0) / (edge1 - edge0));
+        return t * t * (3.f - 2.f * t);
+    }
+
+    // Lighting-invariant selective weight: compare normalized RGB (÷ max channel).
+    // Speckles from shading drop a lot vs raw RGB; AA isolates need DespeckleWeights.
+    float SelectiveWeight(float r, float g, float b, const SelRule& rule)
+    {
+        const float mx = (std::max)(r, (std::max)(g, b));
+        const float mn = (std::min)(r, (std::min)(g, b));
+        if (mx < 0.07f)
+            return 0.f;
+        const float sat = (mx - mn) / mx;
+        if (sat < 0.10f)
+            return 0.f;
+
+        const float smx = (std::max)(rule.sr, (std::max)(rule.sg, rule.sb));
+        if (smx < 0.07f)
+            return 0.f;
+
+        const float nr = r / mx, ng = g / mx, nb = b / mx;
+        const float nsr = rule.sr / smx, nsg = rule.sg / smx, nsb = rule.sb / smx;
+        const float dr = nr - nsr, dg = ng - nsg, db = nb - nsb;
+        const float dist = std::sqrt(dr * dr + dg * dg + db * db);
+        const float tol = (std::max)(0.02f, (std::min)(0.5f, rule.tol));
+        // Normalized space: distances are typically ~0.05..0.6
+        const float maxd = 0.045f + tol * 0.90f;
+        if (dist >= maxd)
+            return 0.f;
+
+        float w = 1.f - Smoothstep01(maxd * 0.30f, maxd, dist);
+        w *= Smoothstep01(0.10f, 0.22f, sat);
+        const float glow = Smoothstep01(0.84f, 0.97f, mx) * Smoothstep01(0.35f, 0.70f, sat);
+        w *= 1.f - glow * 0.92f;
+        return Clamp01(w);
+    }
+
+    void ApplySelectiveWithWeight(float& r, float& g, float& b, const SelRule& rule, float w)
+    {
+        w = Clamp01(w);
+        if (w <= 1e-4f)
+            return;
+        const float lum0 = 0.299f * r + 0.587f * g + 0.114f * b;
+        const float dl = 0.299f * rule.dr + 0.587f * rule.dg + 0.114f * rule.db;
+        float nr, ng, nb;
+        if (dl > 1e-6f)
+        {
+            nr = Clamp01(rule.dr * (lum0 / dl));
+            ng = Clamp01(rule.dg * (lum0 / dl));
+            nb = Clamp01(rule.db * (lum0 / dl));
+        }
+        else
+        {
+            nr = Clamp01(rule.dr * lum0);
+            ng = Clamp01(rule.dg * lum0);
+            nb = Clamp01(rule.db * lum0);
+        }
+        r = Clamp01(r + (nr - r) * w);
+        g = Clamp01(g + (ng - g) * w);
+        b = Clamp01(b + (nb - b) * w);
+    }
+
+    // Kill isolated match pixels; lightly fill holes inside solid regions.
+    void DespeckleWeights(float* w, uint32_t width, uint32_t height)
+    {
+        if (!w || width < 3 || height < 3)
+            return;
+        std::vector<float> tmp(static_cast<size_t>(width) * static_cast<size_t>(height));
+        for (uint32_t y = 0; y < height; ++y)
+        {
+            for (uint32_t x = 0; x < width; ++x)
+            {
+                const size_t i = static_cast<size_t>(y) * width + x;
+                float sum = 0.f;
+                int n = 0;
+                for (int dy = -1; dy <= 1; ++dy)
+                {
+                    for (int dx = -1; dx <= 1; ++dx)
+                    {
+                        if (dx == 0 && dy == 0)
+                            continue;
+                        const int nx = static_cast<int>(x) + dx;
+                        const int ny = static_cast<int>(y) + dy;
+                        if (nx < 0 || ny < 0 || nx >= static_cast<int>(width)
+                            || ny >= static_cast<int>(height))
+                            continue;
+                        sum += w[static_cast<size_t>(ny) * width + static_cast<size_t>(nx)];
+                        ++n;
+                    }
+                }
+                const float avg = (n > 0) ? (sum / static_cast<float>(n)) : 0.f;
+                float v = w[i];
+                if (v > 0.35f && avg < 0.16f)
+                    v = 0.f; // isolated speck
+                else if (v < 0.20f && avg > 0.55f)
+                    v = avg * 0.70f; // fill small hole
+                else
+                    v *= (0.25f + 0.75f * Smoothstep01(0.12f, 0.42f, avg));
+                tmp[i] = Clamp01(v);
+            }
+        }
+        std::memcpy(w, tmp.data(), tmp.size() * sizeof(float));
+    }
+
+    // Selective: normalized-RGB soft mask (+ optional caller-side despeckle).
+    void ApplyOneSelectiveRule(float& r, float& g, float& b, const SelRule& rule)
+    {
+        ApplySelectiveWithWeight(r, g, b, rule, SelectiveWeight(r, g, b, rule));
+    }
+
     void ApplyHslPixel(float& r, float& g, float& b, const SlotHsl& c)
     {
         if (!c.active)
             return;
-        const float lum = 0.299f * r + 0.587f * g + 0.114f * b;
-        r = Clamp01(lum * c.hue);
-        g = Clamp01(lum * c.sat);
-        b = Clamp01(lum * c.light);
+        if (c.mode == 0)
+        {
+            const float lum = 0.299f * r + 0.587f * g + 0.114f * b;
+            r = Clamp01(lum * c.hue);
+            g = Clamp01(lum * c.sat);
+            b = Clamp01(lum * c.light);
+            return;
+        }
+        // Selective: apply chained rules in order (each sees prior output), so a
+        // second Apply that targets the recolored color still works.
+        if (c.ruleCount == 0)
+        {
+            // Legacy single-rule fields
+            SelRule one{};
+            one.sr = c.srcR;
+            one.sg = c.srcG;
+            one.sb = c.srcB;
+            one.dr = c.hue;
+            one.dg = c.sat;
+            one.db = c.light;
+            one.tol = c.tolerance;
+            ApplyOneSelectiveRule(r, g, b, one);
+            return;
+        }
+        for (uint8_t i = 0; i < c.ruleCount; ++i)
+            ApplyOneSelectiveRule(r, g, b, c.rules[i]);
     }
 
     void SaveHslToDisk()
@@ -107,7 +338,32 @@ namespace
             const SlotHsl& h = g_slotHsl[i];
             if (!h.active)
                 continue;
-            fprintf(f, "%d %.6f %.6f %.6f\n", i, h.hue, h.sat, h.light);
+            if (h.mode == 0)
+            {
+                fprintf(f, "%d 0 %.6f %.6f %.6f\n", i, h.hue, h.sat, h.light);
+            }
+            else
+            {
+                // New: slot 1 <count> then count×(sr sg sb dr dg db tol)
+                uint8_t nRules = h.ruleCount;
+                if (nRules == 0)
+                {
+                    fprintf(f, "%d 1 1 %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                        i, h.srcR, h.srcG, h.srcB, h.hue, h.sat, h.light, h.tolerance);
+                }
+                else
+                {
+                    fprintf(f, "%d 1 %u", i, static_cast<unsigned>(nRules));
+                    for (uint8_t r = 0; r < nRules; ++r)
+                    {
+                        const SelRule& rule = h.rules[r];
+                        fprintf(f, " %.6f %.6f %.6f %.6f %.6f %.6f %.6f",
+                            rule.sr, rule.sg, rule.sb,
+                            rule.dr, rule.dg, rule.db, rule.tol);
+                    }
+                    fprintf(f, "\n");
+                }
+            }
         }
         fclose(f);
     }
@@ -118,30 +374,116 @@ namespace
         if (fopen_s(&f, kStateFile, "r") != 0 || !f)
             return;
         int n = 0;
-        char line[256];
+        char line[320];
         while (fgets(line, sizeof(line), f))
         {
             int slot = 0;
-            float r = 1.f, g = 1.f, b = 1.f;
-            if (sscanf_s(line, "%d %f %f %f", &slot, &r, &g, &b) < 4)
-                continue;
+            float t0 = 0.f, t1 = 0.f, t2 = 0.f, t3 = 0.f;
+            const int nProbe = sscanf_s(line, "%d %f %f %f %f", &slot, &t0, &t1, &t2, &t3);
             if (slot < 0 || slot >= kMaxEquipSlots)
                 continue;
-            // Ignore legacy HSL state (hue often 0..360).
-            if (r > 1.01f || g > 1.01f || b > 1.01f || b < -0.01f)
-                continue;
+
             SlotHsl h{};
             h.active = true;
-            h.hue = Clamp01(r);
-            h.sat = Clamp01(g);
-            h.light = Clamp01(b);
+
+            if (nProbe == 4)
+            {
+                // Legacy: slot r g b
+                if (t0 > 1.01f || t1 > 1.01f || t2 > 1.01f || t2 < -0.01f)
+                    continue;
+                h.mode = 0;
+                h.hue = Clamp01(t0);
+                h.sat = Clamp01(t1);
+                h.light = Clamp01(t2);
+            }
+            else
+            {
+                int mode = 0;
+                int count = 0;
+                // Chained selective: "slot 1 <count:1..4> sr sg sb dr dg db tol ..."
+                // (old "slot 1 destR ..." yields count=0 via %d truncation → legacy path)
+                const int nHead = sscanf_s(line, "%d %d %d", &slot, &mode, &count);
+                if (nHead == 3 && mode == 1 && count >= 1 && count <= kMaxSelRules)
+                {
+                    h.mode = 1;
+                    h.ruleCount = 0;
+                    const char* p = line;
+                    // skip slot, mode, count tokens
+                    for (int tok = 0; tok < 3 && p && *p; ++tok)
+                    {
+                        while (*p == ' ' || *p == '\t')
+                            ++p;
+                        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
+                            ++p;
+                    }
+                    for (int r = 0; r < count; ++r)
+                    {
+                        float sr = 0.f, sg = 0.f, sb = 0.f;
+                        float dr = 0.f, dg = 0.f, db = 0.f, tol = 0.35f;
+                        int nRead = 0;
+                        if (sscanf_s(p, " %f %f %f %f %f %f %f%n",
+                                &sr, &sg, &sb, &dr, &dg, &db, &tol, &nRead) < 7 || nRead <= 0)
+                            break;
+                        p += nRead;
+                        SelRule rule{};
+                        rule.sr = Clamp01(sr);
+                        rule.sg = Clamp01(sg);
+                        rule.sb = Clamp01(sb);
+                        rule.dr = Clamp01(dr);
+                        rule.dg = Clamp01(dg);
+                        rule.db = Clamp01(db);
+                        rule.tol = Clamp01(tol);
+                        if (rule.tol < 0.02f)
+                            rule.tol = 0.35f;
+                        h.rules[h.ruleCount++] = rule;
+                    }
+                    if (h.ruleCount == 0)
+                        continue;
+                    SyncSlotMirrorsFromLastRule(h);
+                }
+                else
+                {
+                    float a = 1.f, b = 1.f, c = 1.f, d = 0.f, e = 0.f, f2 = 0.f, tol = 0.35f;
+                    const int nNew = sscanf_s(line, "%d %d %f %f %f %f %f %f %f",
+                        &slot, &mode, &a, &b, &c, &d, &e, &f2, &tol);
+                    if (nNew < 5 || slot < 0 || slot >= kMaxEquipSlots)
+                        continue;
+                    if (a > 1.01f || b > 1.01f || c > 1.01f)
+                        continue;
+                    h.mode = (mode == 1) ? 1 : 0;
+                    h.hue = Clamp01(a);
+                    h.sat = Clamp01(b);
+                    h.light = Clamp01(c);
+                    if (h.mode == 1)
+                    {
+                        if (nNew < 9)
+                            continue;
+                        // Legacy single-rule: dest then src then tol
+                        h.srcR = Clamp01(d);
+                        h.srcG = Clamp01(e);
+                        h.srcB = Clamp01(f2);
+                        h.tolerance = Clamp01(tol);
+                        if (h.tolerance < 0.02f)
+                            h.tolerance = 0.35f;
+                        h.rules[0].sr = h.srcR;
+                        h.rules[0].sg = h.srcG;
+                        h.rules[0].sb = h.srcB;
+                        h.rules[0].dr = h.hue;
+                        h.rules[0].dg = h.sat;
+                        h.rules[0].db = h.light;
+                        h.rules[0].tol = h.tolerance;
+                        h.ruleCount = 1;
+                    }
+                }
+            }
+
             std::lock_guard<std::mutex> lock(g_colorMutex);
             g_slotHsl[slot] = h;
             ++n;
         }
         fclose(f);
         if (n > 0)
-            WLOG_INFO("gear-recolor: loaded {} slot RGB(s) from {}", n, kStateFile);
+            WLOG_INFO("gear-recolor: loaded {} slot tint(s) from {}", n, kStateFile);
     }
 
     bool ContainsCI(const char* hay, const char* needle)
@@ -295,6 +637,12 @@ namespace
     std::atomic<void*> g_localPlayerComponent{ nullptr };
     std::atomic<void*> g_previewComponent{ nullptr };
     std::atomic<bool> g_previewUiActive{ false };
+    std::atomic<bool> g_pendingEnterWorldRebuild{ true };
+    std::atomic<bool> g_insideForcedRebuild{ false };
+    std::atomic<int> g_rebuildBatchDepth{ 0 };
+    std::atomic<uint32_t> g_deferredFullRebuildAt{ 0 };
+    // Natural paste tints since last ClearPlayerScope (char-select / world assemble).
+    std::atomic<uint32_t> g_naturalTintPastes{ 0 };
     std::atomic<uint32_t> g_previewCaptureUntil{ 0 };
     std::atomic<bool> g_forceAllowPaste{ false };
     std::atomic<bool> g_assemblingAllowed{ false };
@@ -309,6 +657,9 @@ namespace
     void* ComponentModel(void* component);
     bool AnySlotActive();
     bool ComponentIsNpc(void* component);
+    void FlushTexTintState(const char* reason);
+    // Char-select one-shot dirty; reset on scope flush so logout→select re-dirties.
+    std::atomic<void*> g_charselectDirtyModel{ nullptr };
 
     // Extra OC roots for paperdoll / char-select / DressUp clones (not world unit+0xB4).
     constexpr int kMaxUiOcRoots = 12;
@@ -490,7 +841,14 @@ namespace
         g_playerModelLocked.store(false, std::memory_order_relaxed);
         g_previewCaptureUntil.store(0, std::memory_order_relaxed);
         g_pendingPreviewForce.store(false, std::memory_order_relaxed);
+        // World re-entry: prefer natural paste tint (char-select quality), not Force.
+        g_pendingEnterWorldRebuild.store(true, std::memory_order_relaxed);
+        g_naturalTintPastes.store(0, std::memory_order_relaxed);
+        g_deferredFullRebuildAt.store(0, std::memory_order_relaxed);
         ClearUiOcRoots();
+        // Logout/relog: TextureCache pointers are freed and reused. Stale g_texTint
+        // "orig" + live pastes corrupt the next char-select until client restart.
+        FlushTexTintState("clear_scope");
     }
 
     bool IsBodyEquipSlot(int slot)
@@ -631,6 +989,47 @@ namespace
             g_pendingPreviewForce.store(true, std::memory_order_relaxed);
     }
 
+    // During pushAll / multi-rule SetSlotSelective, skip per-slot rebuilds — they
+    // re-paste partial section masks and destroy the clean char-select composite.
+    void RequestBodyRebuildForSlot(int slot)
+    {
+        if (g_rebuildBatchDepth.load(std::memory_order_relaxed) > 0)
+            return;
+        ForceAllowedBodyRebuildForSlot(slot);
+    }
+
+    void BeginBodyRebuildBatch()
+    {
+        g_rebuildBatchDepth.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void EndBodyRebuildBatch(bool forceRebuild)
+    {
+        const int d = g_rebuildBatchDepth.fetch_sub(1, std::memory_order_relaxed) - 1;
+        if (d > 0)
+            return;
+        if (d < 0)
+            g_rebuildBatchDepth.store(0, std::memory_order_relaxed);
+
+        const uint32_t nat = g_naturalTintPastes.load(std::memory_order_relaxed);
+        const bool hasPlayer = LocalPlayerBodyModel() != nullptr;
+
+        // Boot / enter-world sync: colors only. Forcing a full 0x3FF rebuild after the
+        // engine already assembled with live paste tints is what made in-world look
+        // worse than char-select Enter World.
+        if (!forceRebuild)
+            return;
+
+        g_pendingEnterWorldRebuild.store(false, std::memory_order_relaxed);
+        g_deferredFullRebuildAt.store(0, std::memory_order_relaxed);
+        ForceAllowedBodyRebuildForSlot(-1);
+    }
+
+    void EndBodyRebuildBatch()
+    {
+        EndBodyRebuildBatch(true);
+    }
+
     // Back-compat wrapper used by Lua preview refresh (full body).
     void ForceAllowedBodyRebuild()
     {
@@ -647,6 +1046,17 @@ namespace
         void* sticky = g_localPlayerComponent.load(std::memory_order_relaxed);
         const bool locked = g_playerModelLocked.load(std::memory_order_relaxed);
         const char* reason = "deny";
+
+        // Logout / return to glue: ActivePlayerGuid clears. Always flush tex cache
+        // here — waiting only on `locked` missed some transitions and left stale
+        // g_texTint keyed by freed pointers (restart was the only recovery).
+        {
+            static std::atomic<bool> s_wasWorldPlayer{ false };
+            if (playerModel)
+                s_wasWorldPlayer.store(true, std::memory_order_relaxed);
+            else if (s_wasWorldPlayer.exchange(false, std::memory_order_relaxed))
+                ClearPlayerScope();
+        }
 
         if (component && !isNpc)
         {
@@ -752,10 +1162,10 @@ namespace
         // once per sticky model so body TextureComponents pick up saved colors.
         if (allowed && !playerModel && AnySlotActive() && component && model)
         {
-            static void* s_charselectDirtyModel = nullptr;
-            if (model != s_charselectDirtyModel)
+            void* prevDirty = g_charselectDirtyModel.load(std::memory_order_relaxed);
+            if (model != prevDirty)
             {
-                s_charselectDirtyModel = model;
+                g_charselectDirtyModel.store(model, std::memory_order_relaxed);
                 __try
                 {
                     *reinterpret_cast<uint32_t*>(
@@ -778,6 +1188,39 @@ namespace
             ? g_origRenderPrep(component, a2)
             : 0;
         g_assemblingAllowed.store(false, std::memory_order_relaxed);
+
+        // After world player locks: if natural paste already tinted (char-select
+        // quality path), do NOT ForceComponentRebuild — that was the "adjustment"
+        // that looked worse than Enter World. Only arm a deferred force when zero
+        // natural tints were seen (colors applied too late).
+        if (allowed && component && AnySlotActive()
+            && g_pendingEnterWorldRebuild.load(std::memory_order_relaxed)
+            && (std::strcmp(reason, "player_model") == 0
+                || std::strcmp(reason, "sticky_component") == 0))
+        {
+            g_pendingEnterWorldRebuild.store(false, std::memory_order_relaxed);
+            const uint32_t nat = g_naturalTintPastes.load(std::memory_order_relaxed);
+            if (nat == 0)
+                g_deferredFullRebuildAt.store(GetTickCount() + 600u, std::memory_order_relaxed);
+            else
+                g_deferredFullRebuildAt.store(0, std::memory_order_relaxed);
+        }
+
+        const uint32_t due = g_deferredFullRebuildAt.load(std::memory_order_relaxed);
+        if (due != 0 && GetTickCount() >= due
+            && allowed && component
+            && !g_insideForcedRebuild.load(std::memory_order_relaxed)
+            && g_rebuildBatchDepth.load(std::memory_order_relaxed) == 0
+            && AnySlotActive()
+            && (std::strcmp(reason, "player_model") == 0
+                || std::strcmp(reason, "sticky_component") == 0))
+        {
+            g_deferredFullRebuildAt.store(0, std::memory_order_relaxed);
+            g_insideForcedRebuild.store(true, std::memory_order_relaxed);
+            ForceComponentRebuild(component, SectionMaskForEquipSlot(-1));
+            g_insideForcedRebuild.store(false, std::memory_order_relaxed);
+        }
+
         return rc;
     }
 
@@ -980,6 +1423,50 @@ namespace
         __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
     }
 
+    void FlushTexTintState(const char* reason)
+    {
+        size_t cacheN = 0;
+        int restored = 0;
+        int liveN = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_texMutex);
+            cacheN = g_texTint.size();
+            for (auto& kv : g_texTint)
+            {
+                void* tex = kv.first;
+                TexTintCache& st = kv.second;
+                if (st.orig.empty())
+                    continue;
+                if (st.paletted)
+                {
+                    uint8_t* pal = SafeGetPal(tex);
+                    if (pal && st.orig.size() >= 256 * 4)
+                    {
+                        std::memcpy(pal, st.orig.data(), 256 * 4);
+                        ++restored;
+                    }
+                }
+                else
+                {
+                    uint8_t* mip0 = SafeGetMip(tex, 0);
+                    if (mip0 && !st.orig.empty())
+                    {
+                        std::memcpy(mip0, st.orig.data(), st.orig.size());
+                        ++restored;
+                    }
+                }
+            }
+            g_texTint.clear();
+            g_texNames.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_livePasteMu);
+            liveN = g_livePasteN;
+            g_livePasteN = 0;
+        }
+        g_charselectDirtyModel.store(nullptr, std::memory_order_relaxed);
+    }
+
     int SafeGetInfo(void* tex, void* info, int flag) noexcept
     {
         auto fn = reinterpret_cast<wxl::offsets::engine::gx::TextureCacheGetInfoFn>(
@@ -988,10 +1475,77 @@ namespace
         __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
     }
 
-    void HslBgraBuffer(uint8_t* pixels, size_t count, const SlotHsl& hsl, bool skipLowAlpha)
+    void HslBgraBuffer(uint8_t* pixels, size_t count, const SlotHsl& hsl, bool skipLowAlpha,
+                       uint32_t width = 0, uint32_t height = 0)
     {
         if (!pixels || !count || !hsl.active || IsIdentityHsl(hsl))
             return;
+
+        // Selective on a real 2D mip: weight → despeckle → apply (kills isolated pixels).
+        const bool canDespeckle = (hsl.mode == 1) && width >= 3 && height >= 3
+            && (static_cast<size_t>(width) * static_cast<size_t>(height) == count);
+        if (canDespeckle)
+        {
+            std::vector<SelRule> rules;
+            if (hsl.ruleCount == 0)
+            {
+                SelRule one{};
+                one.sr = hsl.srcR; one.sg = hsl.srcG; one.sb = hsl.srcB;
+                one.dr = hsl.hue; one.dg = hsl.sat; one.db = hsl.light;
+                one.tol = hsl.tolerance;
+                rules.push_back(one);
+            }
+            else
+            {
+                for (uint8_t ri = 0; ri < hsl.ruleCount; ++ri)
+                    rules.push_back(hsl.rules[ri]);
+            }
+
+            std::vector<float> weights(count);
+            for (const SelRule& rule : rules)
+            {
+                for (size_t i = 0; i < count; ++i)
+                {
+                    uint8_t* p = pixels + i * 4;
+                    const uint8_t a = p[3];
+                    if (skipLowAlpha && a < 8)
+                    {
+                        weights[i] = 0.f;
+                        continue;
+                    }
+                    if (p[0] < 8 && p[1] < 8 && p[2] < 8)
+                    {
+                        weights[i] = 0.f;
+                        continue;
+                    }
+                    const float r = p[2] * (1.f / 255.f);
+                    const float g = p[1] * (1.f / 255.f);
+                    const float b = p[0] * (1.f / 255.f);
+                    weights[i] = SelectiveWeight(r, g, b, rule);
+                }
+                DespeckleWeights(weights.data(), width, height);
+                // Second pass tightens leftover speckles
+                DespeckleWeights(weights.data(), width, height);
+
+                for (size_t i = 0; i < count; ++i)
+                {
+                    if (weights[i] <= 1e-4f)
+                        continue;
+                    uint8_t* p = pixels + i * 4;
+                    const uint8_t a = p[3];
+                    float r = p[2] * (1.f / 255.f);
+                    float g = p[1] * (1.f / 255.f);
+                    float b = p[0] * (1.f / 255.f);
+                    ApplySelectiveWithWeight(r, g, b, rule, weights[i]);
+                    p[0] = static_cast<uint8_t>(b * 255.f + 0.5f);
+                    p[1] = static_cast<uint8_t>(g * 255.f + 0.5f);
+                    p[2] = static_cast<uint8_t>(r * 255.f + 0.5f);
+                    p[3] = a;
+                }
+            }
+            return;
+        }
+
         for (size_t i = 0; i < count; ++i)
         {
             uint8_t* p = pixels + i * 4;
@@ -1030,7 +1584,8 @@ namespace
         auto* pixels = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(table[0]));
         if (!pixels)
             return false;
-        HslBgraBuffer(pixels, static_cast<size_t>(width) * static_cast<size_t>(height), hsl, true);
+        HslBgraBuffer(pixels, static_cast<size_t>(width) * static_cast<size_t>(height),
+            hsl, true, width, height);
         return true;
     }
 
@@ -1086,7 +1641,8 @@ namespace
         if (pal)
         {
             // Keep mip indices; tint the 256 palette from the cached ORIGINAL only.
-            // Remapping indices (requant) destroys authored metal dither.
+            // (Spatial expand/despeckle+index-remap was REJECTED: remapped thousands of
+            // pixels per paste and caused severe graphic corruption — see body-path logs.)
             if (outMode)
                 *outMode = "palette_rgb";
             uint8_t info[8] = {};
@@ -1097,10 +1653,17 @@ namespace
                 h = *reinterpret_cast<uint16_t*>(info + 2);
             }
             uint8_t* mip0 = SafeGetMip(tex, 0);
-            int changed = 0;
             {
                 std::lock_guard<std::mutex> lock(g_texMutex);
                 TexTintCache& st = g_texTint[tex];
+                // Pointer reuse after logout: same void* may now be a different BLP.
+                if (!st.orig.empty() && name && !st.path.empty()
+                    && _stricmp(st.path.c_str(), name) != 0)
+                {
+                    st = {};
+                }
+                if (st.path.empty() && name)
+                    st.path = name;
                 if (st.orig.empty())
                 {
                     st.paletted = true;
@@ -1119,13 +1682,59 @@ namespace
                 if (st.orig.size() < 256 * 4)
                     return false;
                 // Always re-tint from orig (never stack on already-tinted pal).
-                // Do NOT rewrite mip indices — that swapped/corrupted layer looks.
+                // Do NOT rewrite mip indices.
                 std::memcpy(pal, st.orig.data(), 256 * 4);
-                HslBgraBuffer(pal, 256, hsl, false);
-                for (int i = 0; i < 256; ++i)
+                // Selective on palette: slightly harder gate than OC to limit fringe
+                // speckles without touching indices (soft despeckle cannot run on 256).
+                if (hsl.mode == 1)
                 {
-                    if (std::memcmp(pal + i * 4, st.orig.data() + i * 4, 3) != 0)
-                        ++changed;
+                    for (int i = 0; i < 256; ++i)
+                    {
+                        float r = pal[i * 4 + 2] * (1.f / 255.f);
+                        float g = pal[i * 4 + 1] * (1.f / 255.f);
+                        float b = pal[i * 4 + 0] * (1.f / 255.f);
+                        float wmax = 0.f;
+                        if (hsl.ruleCount == 0)
+                        {
+                            SelRule one{};
+                            one.sr = hsl.srcR; one.sg = hsl.srcG; one.sb = hsl.srcB;
+                            one.dr = hsl.hue; one.dg = hsl.sat; one.db = hsl.light;
+                            one.tol = hsl.tolerance;
+                            wmax = SelectiveWeight(r, g, b, one);
+                        }
+                        else
+                        {
+                            for (uint8_t ri = 0; ri < hsl.ruleCount; ++ri)
+                                wmax = (std::max)(wmax, SelectiveWeight(r, g, b, hsl.rules[ri]));
+                        }
+                        // Harder than mesh PS: skip weak palette fringe entries.
+                        if (wmax < 0.45f)
+                            continue;
+                        if (hsl.ruleCount == 0)
+                        {
+                            SelRule one{};
+                            one.sr = hsl.srcR; one.sg = hsl.srcG; one.sb = hsl.srcB;
+                            one.dr = hsl.hue; one.dg = hsl.sat; one.db = hsl.light;
+                            one.tol = hsl.tolerance;
+                            ApplySelectiveWithWeight(r, g, b, one, wmax);
+                        }
+                        else
+                        {
+                            for (uint8_t ri = 0; ri < hsl.ruleCount; ++ri)
+                            {
+                                const float wi = SelectiveWeight(r, g, b, hsl.rules[ri]);
+                                if (wi >= 0.45f)
+                                    ApplySelectiveWithWeight(r, g, b, hsl.rules[ri], wi);
+                            }
+                        }
+                        pal[i * 4 + 2] = static_cast<uint8_t>(Clamp01(r) * 255.f + 0.5f);
+                        pal[i * 4 + 1] = static_cast<uint8_t>(Clamp01(g) * 255.f + 0.5f);
+                        pal[i * 4 + 0] = static_cast<uint8_t>(Clamp01(b) * 255.f + 0.5f);
+                    }
+                }
+                else
+                {
+                    HslBgraBuffer(pal, 256, hsl, false);
                 }
             }
             return true;
@@ -1152,6 +1761,13 @@ namespace
         const size_t bytes = static_cast<size_t>(w) * static_cast<size_t>(h) * 4u;
         std::lock_guard<std::mutex> lock(g_texMutex);
         TexTintCache& st = g_texTint[tex];
+        if (!st.orig.empty() && name && !st.path.empty()
+            && _stricmp(st.path.c_str(), name) != 0)
+        {
+            st = {};
+        }
+        if (st.path.empty() && name)
+            st.path = name;
         if (st.orig.empty())
         {
             st.paletted = false;
@@ -1162,7 +1778,7 @@ namespace
         if (st.orig.size() < bytes)
             return false;
         std::memcpy(mip0, st.orig.data(), bytes);
-        HslBgraBuffer(mip0, static_cast<size_t>(w) * static_cast<size_t>(h), hsl, true);
+        HslBgraBuffer(mip0, static_cast<size_t>(w) * static_cast<size_t>(h), hsl, true, w, h);
         return true;
     }
 
@@ -1310,6 +1926,8 @@ namespace
                     const char* mode = "none";
                     const bool ok = TintTextureCacheForPaste(srcTexture, name, hsl, slot, &mode);
                     didTint = ok;
+                    if (ok && !g_forceAllowPaste.load(std::memory_order_relaxed))
+                        g_naturalTintPastes.fetch_add(1, std::memory_order_relaxed);
                 }
                 else
                 {
@@ -1334,6 +1952,7 @@ namespace
             return;
         SlotHsl h{};
         h.active = true;
+        h.mode = 0;
         h.hue = Clamp01(r);
         h.sat = Clamp01(g);
         h.light = Clamp01(b);
@@ -1344,11 +1963,72 @@ namespace
         NotifyOcSlotChanged(slot);
         if (g_previewUiActive.load(std::memory_order_relaxed))
             ArmPreviewCapture(800);
-        // Body: per-slot dirty + RenderPrep (good live path). Do NOT ReplayLivePastes —
-        // that painted the shared staging buffer for every layer and cross-influenced slots.
-        // OC slots: mesh PS only — never force a full body rebuild.
         if (IsBodyEquipSlot(slot))
-            ForceAllowedBodyRebuildForSlot(slot);
+            RequestBodyRebuildForSlot(slot);
+        SaveHslToDisk();
+    }
+
+    void SetSlotSelective(int slot, float sr, float sg, float sb,
+                          float dr, float dg, float db, float tol,
+                          bool forceAppend = false)
+    {
+        if (slot < 0 || slot >= kMaxEquipSlots)
+            return;
+        SelRule neu{};
+        neu.sr = Clamp01(sr);
+        neu.sg = Clamp01(sg);
+        neu.sb = Clamp01(sb);
+        neu.dr = Clamp01(dr);
+        neu.dg = Clamp01(dg);
+        neu.db = Clamp01(db);
+        neu.tol = Clamp01(tol);
+        if (neu.tol < 0.02f)
+            neu.tol = 0.35f;
+
+        const char* action = "new";
+        SlotHsl h{};
+        {
+            std::lock_guard<std::mutex> lock(g_colorMutex);
+            h = g_slotHsl[slot];
+            // Switching from solid / empty → start a fresh selective chain.
+            if (!h.active || h.mode != 1)
+            {
+                h = {};
+                h.active = true;
+                h.mode = 1;
+                h.rules[0] = neu;
+                h.ruleCount = 1;
+                action = "new";
+            }
+            else if (!forceAppend && h.ruleCount > 0 &&
+                SameSelectiveSrc(h.rules[h.ruleCount - 1], neu.sr, neu.sg, neu.sb))
+            {
+                // Same source as last rule → only update destination / tol.
+                h.rules[h.ruleCount - 1] = neu;
+                action = "update_last";
+            }
+            else if (h.ruleCount < kMaxSelRules)
+            {
+                h.rules[h.ruleCount++] = neu;
+                action = forceAppend ? "force_append" : "append";
+            }
+            else
+            {
+                // Drop oldest, append newest (max 4 chained replaces).
+                for (int i = 0; i < kMaxSelRules - 1; ++i)
+                    h.rules[i] = h.rules[i + 1];
+                h.rules[kMaxSelRules - 1] = neu;
+                h.ruleCount = kMaxSelRules;
+                action = "shift_append";
+            }
+            SyncSlotMirrorsFromLastRule(h);
+            g_slotHsl[slot] = h;
+        }
+        NotifyOcSlotChanged(slot);
+        if (g_previewUiActive.load(std::memory_order_relaxed))
+            ArmPreviewCapture(800);
+        if (IsBodyEquipSlot(slot))
+            RequestBodyRebuildForSlot(slot);
         SaveHslToDisk();
     }
 
@@ -1364,7 +2044,7 @@ namespace
         if (g_previewUiActive.load(std::memory_order_relaxed))
             ArmPreviewCapture(800);
         if (IsBodyEquipSlot(slot))
-            ForceAllowedBodyRebuildForSlot(slot);
+            RequestBodyRebuildForSlot(slot);
         SaveHslToDisk();
     }
 
@@ -1376,15 +2056,13 @@ namespace
                 g_slotHsl[i] = {};
         }
         g_ocPixelTintLive.store(false, std::memory_order_relaxed);
-        ForceAllowedBodyRebuildForSlot(-1);
+        RequestBodyRebuildForSlot(-1);
         SaveHslToDisk();
     }
 
-    // OC mesh: luminance * picked RGB, then * vertex diffuse so character
-    // lighting / near-camera fade stay (body textures keep lighting because
-    // tint happens before the engine light pass; our EQUAL redraw must not
-    // discard COLOR0).
-    constexpr char kHslPsHlsl[] = R"(
+    // Solid OC PS — keep byte-stable with the proven lighting path (do not share
+    // a branched shader with selective; that changed Solid results).
+    constexpr char kSolidPsHlsl[] = R"(
 sampler2D s0 : register(s0);
 float4 c0 : register(c0);
 
@@ -1398,11 +2076,83 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
 }
 )";
 
-    IDirect3DPixelShader9* EnsureHslPs(void* deviceRaw)
+    // Selective OC PS v8: normalized-RGB soft match + 4-neighbor despeckle.
+    // (v6 full HSV failed SM2; v7 soft RGB still speckled on AA edges.)
+    constexpr char kSelectivePsHlsl[] = R"(
+sampler2D s0 : register(s0);
+float4 c0 : register(c0);
+float4 c1 : register(c1);
+float4 c2 : register(c2);
+float4 c3 : register(c3);
+float4 c4 : register(c4);
+float4 c5 : register(c5);
+float4 c6 : register(c6);
+float4 c7 : register(c7);
+float4 c8 : register(c8);
+
+float matchW(float3 c, float3 src, float tol)
+{
+    float mx = max(c.r, max(c.g, c.b));
+    float mn = min(c.r, min(c.g, c.b));
+    if (mx < 0.07) return 0.0;
+    float sat = (mx - mn) / mx;
+    if (sat < 0.10) return 0.0;
+    float smx = max(src.r, max(src.g, src.b));
+    if (smx < 0.07) return 0.0;
+    float3 n = c / mx;
+    float3 ns = src / smx;
+    float dist = sqrt(dot(n - ns, n - ns));
+    float maxd = 0.045 + saturate(tol) * 0.90;
+    if (dist >= maxd) return 0.0;
+    float t = saturate((dist - maxd * 0.30) / max(0.001, maxd * 0.70));
+    float w = 1.0 - (t * t * (3.0 - 2.0 * t));
+    float satT = saturate((sat - 0.10) / 0.12);
+    w *= satT * satT * (3.0 - 2.0 * satT);
+    float glow = saturate((mx - 0.84) / 0.13) * saturate((sat - 0.35) / 0.35);
+    return saturate(w * (1.0 - glow * 0.92));
+}
+
+float3 applyRule(float3 c, float2 uv, float3 src, float3 dst, float tol)
+{
+    float w0 = matchW(c, src, tol);
+    float dx = 0.00390625; // 1/256 — neighbor consensus / despeckle
+    float nsum = matchW(tex2D(s0, uv + float2(dx, 0)).rgb, src, tol)
+               + matchW(tex2D(s0, uv + float2(-dx, 0)).rgb, src, tol)
+               + matchW(tex2D(s0, uv + float2(0, dx)).rgb, src, tol)
+               + matchW(tex2D(s0, uv + float2(0, -dx)).rgb, src, tol);
+    float navg = nsum * 0.25;
+    if (w0 > 0.35 && navg < 0.16) w0 = 0.0;
+    else if (w0 < 0.20 && navg > 0.55) w0 = navg * 0.70;
+    else
+    {
+        float ct = saturate((navg - 0.12) / 0.30);
+        w0 *= 0.25 + 0.75 * (ct * ct * (3.0 - 2.0 * ct));
+    }
+    w0 = saturate(w0);
+    if (w0 <= 0.001) return c;
+    float lum = dot(c, float3(0.299, 0.587, 0.114));
+    float dl = dot(dst, float3(0.299, 0.587, 0.114));
+    float3 repl = (dl > 0.001) ? saturate(dst * (lum / dl)) : saturate(dst * lum);
+    return saturate(lerp(c, repl, w0));
+}
+
+float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
+{
+    float4 t = tex2D(s0, uv);
+    float3 colored = t.rgb;
+    if (c0.a >= 0.5) colored = applyRule(colored, uv, c1.rgb, c2.rgb, c1.a);
+    if (c0.a >= 1.5) colored = applyRule(colored, uv, c3.rgb, c4.rgb, c3.a);
+    if (c0.a >= 2.5) colored = applyRule(colored, uv, c5.rgb, c6.rgb, c5.a);
+    float3 outRgb = saturate(colored * diff.rgb);
+    return float4(outRgb, saturate(t.a * diff.a));
+}
+)";
+
+    IDirect3DPixelShader9* EnsureSolidPs(void* deviceRaw)
     {
         static IDirect3DPixelShader9* ps = nullptr;
         static int compiledVer = 0;
-        constexpr int kPsVer = 2; // v2: multiply vertex diffuse (lighting/fade)
+        constexpr int kPsVer = 2; // locked to proven solid+diffuse
         if (compiledVer == kPsVer)
             return ps;
         compiledVer = kPsVer;
@@ -1412,13 +2162,145 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
             ps = nullptr;
         }
         ps = static_cast<IDirect3DPixelShader9*>(
-            gx::CompilePixelShader(gx::Device9(deviceRaw), kHslPsHlsl, "ps_2_0"));
+            gx::CompilePixelShader(gx::Device9(deviceRaw), kSolidPsHlsl, "ps_2_0"));
         g_hslPsState.store(ps ? 1 : 0, std::memory_order_relaxed);
         if (ps)
-            WLOG_INFO("gear-recolor: OC colorize PS v%d ready (diffuse lit)", kPsVer);
+            WLOG_INFO("gear-recolor: solid OC PS v%d ready", kPsVer);
         else
-            WLOG_WARN("gear-recolor: OC PS compile failed; FF fallback");
+            WLOG_WARN("gear-recolor: solid OC PS compile failed");
         return ps;
+    }
+
+    IDirect3DPixelShader9* EnsureSelectivePs(void* deviceRaw)
+    {
+        static IDirect3DPixelShader9* ps = nullptr;
+        static int compiledVer = 0;
+        constexpr int kPsVer = 8; // v8: norm-RGB + neighbor despeckle
+        if (compiledVer == kPsVer)
+            return ps;
+        compiledVer = kPsVer;
+        if (ps)
+        {
+            ps->Release();
+            ps = nullptr;
+        }
+        ps = static_cast<IDirect3DPixelShader9*>(
+            gx::CompilePixelShader(gx::Device9(deviceRaw), kSelectivePsHlsl, "ps_2_0"));
+        int profile = 0;
+        if (ps)
+            profile = 20;
+        if (!ps)
+        {
+            ps = static_cast<IDirect3DPixelShader9*>(
+                gx::CompilePixelShader(gx::Device9(deviceRaw), kSelectivePsHlsl, "ps_2_a"));
+            if (ps)
+                profile = 21;
+        }
+        if (ps)
+            WLOG_INFO("gear-recolor: selective OC PS v%d ready (profile=%d)", kPsVer, profile);
+        else
+            WLOG_WARN("gear-recolor: selective OC PS compile failed");
+        return ps;
+    }
+
+    // --- Screen eyedropper (sample backbuffer under cursor) ---
+    std::atomic<bool> g_sampleArmed{ false };
+    std::atomic<bool> g_sampleReady{ false };
+    std::atomic<bool> g_samplePending{ false };
+    float g_sampleRgb[3] = { 0.f, 0.f, 0.f };
+    int g_sampleClientX = 0;
+    int g_sampleClientY = 0;
+    std::mutex g_sampleMu;
+
+    bool SampleBackbufferAt(IDirect3DDevice9* dev, int cx, int cy, float outRgb[3])
+    {
+        if (!dev || !outRgb)
+            return false;
+        IDirect3DSurface9* bb = nullptr;
+        if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb)
+            return false;
+
+        D3DSURFACE_DESC desc{};
+        bb->GetDesc(&desc);
+        IDirect3DSurface9* staging = nullptr;
+        HRESULT hr = dev->CreateOffscreenPlainSurface(
+            desc.Width, desc.Height, desc.Format, D3DPOOL_SYSTEMMEM, &staging, nullptr);
+        if (FAILED(hr) || !staging)
+        {
+            bb->Release();
+            return false;
+        }
+        hr = dev->GetRenderTargetData(bb, staging);
+        bb->Release();
+        if (FAILED(hr))
+        {
+            staging->Release();
+            return false;
+        }
+
+        if (cx < 0)
+            cx = 0;
+        if (cy < 0)
+            cy = 0;
+        if (cx >= static_cast<int>(desc.Width))
+            cx = static_cast<int>(desc.Width) - 1;
+        if (cy >= static_cast<int>(desc.Height))
+            cy = static_cast<int>(desc.Height) - 1;
+
+        D3DLOCKED_RECT lr{};
+        RECT rc{ cx, cy, cx + 1, cy + 1 };
+        hr = staging->LockRect(&lr, &rc, D3DLOCK_READONLY);
+        if (FAILED(hr))
+        {
+            staging->Release();
+            return false;
+        }
+
+        const uint8_t* p = static_cast<const uint8_t*>(lr.pBits);
+        float r = 0.f, g = 0.f, b = 0.f;
+        // Common WoW backbuffer: A8R8G8B8 / X8R8G8B8 (BGRA in memory).
+        if (desc.Format == D3DFMT_A8R8G8B8 || desc.Format == D3DFMT_X8R8G8B8
+            || desc.Format == D3DFMT_A8B8G8R8 || desc.Format == D3DFMT_X8B8G8R8)
+        {
+            if (desc.Format == D3DFMT_A8B8G8R8 || desc.Format == D3DFMT_X8B8G8R8)
+            {
+                r = p[0] / 255.f;
+                g = p[1] / 255.f;
+                b = p[2] / 255.f;
+            }
+            else
+            {
+                b = p[0] / 255.f;
+                g = p[1] / 255.f;
+                r = p[2] / 255.f;
+            }
+        }
+        else
+        {
+            // Fallback: treat as BGRA8
+            b = p[0] / 255.f;
+            g = p[1] / 255.f;
+            r = p[2] / 255.f;
+        }
+        staging->UnlockRect();
+        staging->Release();
+        outRgb[0] = Clamp01(r);
+        outRgb[1] = Clamp01(g);
+        outRgb[2] = Clamp01(b);
+        return true;
+    }
+
+    void ArmScreenSample()
+    {
+        g_sampleReady.store(false, std::memory_order_relaxed);
+        g_samplePending.store(false, std::memory_order_relaxed);
+        g_sampleArmed.store(true, std::memory_order_relaxed);
+    }
+
+    void DisarmScreenSample()
+    {
+        g_sampleArmed.store(false, std::memory_order_relaxed);
+        g_samplePending.store(false, std::memory_order_relaxed);
     }
 
     constexpr char kPreviewTgaPath0[] =
@@ -1664,6 +2546,25 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
         return 1;
     }
 
+    int __cdecl LuaRecolorSetSlotSelective(void* state)
+    {
+        if (!state || wlua::GetTop(state) < 8)
+            return 0;
+        const int slot = static_cast<int>(wlua::ToNumber(state, 1));
+        const float sr = static_cast<float>(wlua::ToNumber(state, 2));
+        const float sg = static_cast<float>(wlua::ToNumber(state, 3));
+        const float sb = static_cast<float>(wlua::ToNumber(state, 4));
+        const float dr = static_cast<float>(wlua::ToNumber(state, 5));
+        const float dg = static_cast<float>(wlua::ToNumber(state, 6));
+        const float db = static_cast<float>(wlua::ToNumber(state, 7));
+        const float tol = static_cast<float>(wlua::ToNumber(state, 8));
+        const bool forceAppend = (wlua::GetTop(state) >= 9)
+            && (wlua::ToNumber(state, 9) != 0.0);
+        SetSlotSelective(slot, sr, sg, sb, dr, dg, db, tol, forceAppend);
+        wlua::PushBoolean(state, 1);
+        return 1;
+    }
+
     int __cdecl LuaRecolorGetSlotTexPath(void* state)
     {
         if (!state || wlua::GetTop(state) < 1)
@@ -1718,7 +2619,13 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
         wlua::PushNumber(state, static_cast<double>(h.sat));
         wlua::PushNumber(state, static_cast<double>(h.light));
         wlua::PushNumber(state, h.active ? 1.0 : 0.0);
-        return 4;
+        wlua::PushNumber(state, static_cast<double>(h.mode));
+        wlua::PushNumber(state, static_cast<double>(h.srcR));
+        wlua::PushNumber(state, static_cast<double>(h.srcG));
+        wlua::PushNumber(state, static_cast<double>(h.srcB));
+        wlua::PushNumber(state, static_cast<double>(h.tolerance));
+        wlua::PushNumber(state, static_cast<double>(h.ruleCount));
+        return 10;
     }
 
     int __cdecl LuaRecolorClearSlot(void* state)
@@ -1803,8 +2710,49 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
         return 0;
     }
 
+    int __cdecl LuaRecolorBeginBatch(void* state)
+    {
+        BeginBodyRebuildBatch();
+        if (state)
+        {
+            wlua::PushBoolean(state, 1);
+            return 1;
+        }
+        return 0;
+    }
+
+    int __cdecl LuaRecolorEndBatch(void* state)
+    {
+        // arg1 optional: 0 = sync colors only (enter-world), 1/default = force full rebuild
+        bool forceRebuild = true;
+        if (state && wlua::GetTop(state) >= 1)
+            forceRebuild = (wlua::ToNumber(state, 1) != 0.0);
+        EndBodyRebuildBatch(forceRebuild);
+        if (state)
+        {
+            wlua::PushBoolean(state, 1);
+            return 1;
+        }
+        return 0;
+    }
+
+    int __cdecl LuaRecolorFlushTex(void* state)
+    {
+        FlushTexTintState("lua_leaving");
+        g_pendingEnterWorldRebuild.store(true, std::memory_order_relaxed);
+        g_naturalTintPastes.store(0, std::memory_order_relaxed);
+        if (state)
+        {
+            wlua::PushBoolean(state, 1);
+            return 1;
+        }
+        return 0;
+    }
+
     int __cdecl LuaRecolorForceBodyRebuild(void* state)
     {
+        g_pendingEnterWorldRebuild.store(false, std::memory_order_relaxed);
+        g_deferredFullRebuildAt.store(0, std::memory_order_relaxed);
         ForceAllowedBodyRebuild();
         if (state)
         {
@@ -1812,6 +2760,49 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
             return 1;
         }
         return 0;
+    }
+
+    int __cdecl LuaRecolorArmScreenSample(void* state)
+    {
+        ArmScreenSample();
+        if (state)
+        {
+            wlua::PushBoolean(state, 1);
+            return 1;
+        }
+        return 0;
+    }
+
+    int __cdecl LuaRecolorCancelScreenSample(void* state)
+    {
+        DisarmScreenSample();
+        if (state)
+        {
+            wlua::PushBoolean(state, 1);
+            return 1;
+        }
+        return 0;
+    }
+
+    int __cdecl LuaRecolorGetScreenSample(void* state)
+    {
+        if (!state)
+            return 0;
+        const bool ready = g_sampleReady.load(std::memory_order_relaxed);
+        float rgb[3] = {};
+        if (ready)
+        {
+            std::lock_guard<std::mutex> lock(g_sampleMu);
+            rgb[0] = g_sampleRgb[0];
+            rgb[1] = g_sampleRgb[1];
+            rgb[2] = g_sampleRgb[2];
+            g_sampleReady.store(false, std::memory_order_relaxed);
+        }
+        wlua::PushNumber(state, static_cast<double>(rgb[0]));
+        wlua::PushNumber(state, static_cast<double>(rgb[1]));
+        wlua::PushNumber(state, static_cast<double>(rgb[2]));
+        wlua::PushNumber(state, ready ? 1.0 : 0.0);
+        return 4;
     }
 
     class GearRecolor final : public ev::EventScript
@@ -1826,6 +2817,7 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
             }
 
             wlua::RegisterFunction("WXL_RecolorSetSlot", &LuaRecolorSetSlot);
+            wlua::RegisterFunction("WXL_RecolorSetSlotSelective", &LuaRecolorSetSlotSelective);
             wlua::RegisterFunction("WXL_RecolorGetSlot", &LuaRecolorGetSlot);
             wlua::RegisterFunction("WXL_RecolorGetSlotTexPath", &LuaRecolorGetSlotTexPath);
             wlua::RegisterFunction("WXL_RecolorBakePreview", &LuaRecolorBakePreview);
@@ -1836,13 +2828,59 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
             wlua::RegisterFunction("WXL_RecolorArmUiCapture", &LuaRecolorArmUiCapture);
             wlua::RegisterFunction("WXL_RecolorSetCharacterUiActive", &LuaRecolorSetCharacterUiActive);
             wlua::RegisterFunction("WXL_RecolorForceBodyRebuild", &LuaRecolorForceBodyRebuild);
+            wlua::RegisterFunction("WXL_RecolorBeginBatch", &LuaRecolorBeginBatch);
+            wlua::RegisterFunction("WXL_RecolorEndBatch", &LuaRecolorEndBatch);
+            wlua::RegisterFunction("WXL_RecolorFlushTex", &LuaRecolorFlushTex);
+            wlua::RegisterFunction("WXL_RecolorArmScreenSample", &LuaRecolorArmScreenSample);
+            wlua::RegisterFunction("WXL_RecolorCancelScreenSample", &LuaRecolorCancelScreenSample);
+            wlua::RegisterFunction("WXL_RecolorGetScreenSample", &LuaRecolorGetScreenSample);
 
             LoadHslFromDisk();
 
             on<&GearRecolor::OnBatchDraw>(ev::Event::OnM2BatchDraw);
             on<&GearRecolor::OnBlpLoad>(ev::Event::OnBlpLoad);
             on<&GearRecolor::OnTextureUpload>(ev::Event::OnTextureUpload);
+            on<&GearRecolor::OnInput>(ev::Event::OnInput);
+            on<&GearRecolor::OnEndScene>(ev::Event::OnEndScene);
             WLOG_INFO("gear-recolor: events bound (paste hooks via modules::Register)");
+        }
+
+        void OnInput(const ev::InputArgs& a)
+        {
+            // WM_LBUTTONDOWN = 0x0201
+            if (!g_sampleArmed.load(std::memory_order_relaxed) || a.message != 0x0201u)
+                return;
+            POINT pt{};
+            GetCursorPos(&pt);
+            HWND hwnd = GetForegroundWindow();
+            if (hwnd)
+                ScreenToClient(hwnd, &pt);
+            g_sampleClientX = pt.x;
+            g_sampleClientY = pt.y;
+            g_samplePending.store(true, std::memory_order_relaxed);
+            g_sampleArmed.store(false, std::memory_order_relaxed);
+            if (a.handled)
+                *a.handled = true;
+        }
+
+        void OnEndScene(const ev::EndSceneArgs& a)
+        {
+            if (!g_samplePending.exchange(false, std::memory_order_relaxed))
+                return;
+            auto* dev = static_cast<IDirect3DDevice9*>(a.device);
+            if (!dev)
+                return;
+
+            float rgb[3] = {};
+            if (!SampleBackbufferAt(dev, g_sampleClientX, g_sampleClientY, rgb))
+                return;
+            {
+                std::lock_guard<std::mutex> lock(g_sampleMu);
+                g_sampleRgb[0] = rgb[0];
+                g_sampleRgb[1] = rgb[1];
+                g_sampleRgb[2] = rgb[2];
+            }
+            g_sampleReady.store(true, std::memory_order_relaxed);
         }
 
         void OnBatchDraw(const ev::M2BatchDrawArgs& a)
@@ -1917,17 +2955,75 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
             dev->GetTextureStageState(0, D3DTSS_ALPHAARG1, &oldAArg1);
             dev->GetTextureStageState(0, D3DTSS_ALPHAARG2, &oldAArg2);
 
-            IDirect3DPixelShader9* hslPs = EnsureHslPs(a.device);
-            const bool usePs = (hslPs != nullptr);
+            DWORD blend = 0, srcBlend = 0, dstBlend = 0, alphaTest = 0;
+            dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &blend);
+            dev->GetRenderState(D3DRS_SRCBLEND, &srcBlend);
+            dev->GetRenderState(D3DRS_DESTBLEND, &dstBlend);
+            dev->GetRenderState(D3DRS_ALPHATESTENABLE, &alphaTest);
+
+            IDirect3DPixelShader9* tintPs = nullptr;
+            const bool selective = (hsl.mode == 1);
+            if (selective)
+                tintPs = EnsureSelectivePs(a.device);
+            else
+                tintPs = EnsureSolidPs(a.device);
+            const bool usePs = (tintPs != nullptr);
+
+
+            // Selective without PS must NOT fall back to full-mesh TF modulate
+            // (that recolors the wrong parts / whole weapon).
+            if (selective && !usePs)
+            {
+                if (oldPs)
+                    oldPs->Release();
+                return;
+            }
 
             dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_EQUAL);
             dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
 
             if (usePs)
             {
-                const float c0[4] = { hsl.hue, hsl.sat, hsl.light, 1.f };
-                dev->SetPixelShader(hslPs);
-                dev->SetPixelShaderConstantF(0, c0, 1);
+                if (selective)
+                {
+                    float consts[9][4] = {};
+                    uint8_t nRules = hsl.ruleCount;
+                    if (nRules == 0)
+                    {
+                        // Legacy mirrors → single rule
+                        nRules = 1;
+                        consts[1][0] = hsl.srcR;
+                        consts[1][1] = hsl.srcG;
+                        consts[1][2] = hsl.srcB;
+                        consts[1][3] = hsl.tolerance > 0.f ? hsl.tolerance : 0.35f;
+                        consts[2][0] = hsl.hue;
+                        consts[2][1] = hsl.sat;
+                        consts[2][2] = hsl.light;
+                    }
+                    else
+                    {
+                        for (uint8_t i = 0; i < nRules && i < kMaxSelRules; ++i)
+                        {
+                            const SelRule& r = hsl.rules[i];
+                            consts[1 + i * 2][0] = r.sr;
+                            consts[1 + i * 2][1] = r.sg;
+                            consts[1 + i * 2][2] = r.sb;
+                            consts[1 + i * 2][3] = r.tol > 0.f ? r.tol : 0.35f;
+                            consts[2 + i * 2][0] = r.dr;
+                            consts[2 + i * 2][1] = r.dg;
+                            consts[2 + i * 2][2] = r.db;
+                        }
+                    }
+                    consts[0][3] = static_cast<float>(nRules);
+                    dev->SetPixelShader(tintPs);
+                    dev->SetPixelShaderConstantF(0, &consts[0][0], 9);
+                }
+                else
+                {
+                    const float c0[4] = { hsl.hue, hsl.sat, hsl.light, 1.f };
+                    dev->SetPixelShader(tintPs);
+                    dev->SetPixelShaderConstantF(0, c0, 1);
+                }
             }
             else
             {

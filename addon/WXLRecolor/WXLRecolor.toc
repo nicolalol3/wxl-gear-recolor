@@ -2,7 +2,7 @@
 ## Title: WXL Recolor
 ## Notes: Per-slot gear colorize for WarcraftXL (requires wxl-gear-recolor module).
 ## Author: nicolalol2
-## Version: 1.0
+## Version: 1.2
 ## SavedVariables: WXLRecolorDB
 
 WXLRecolor.lua

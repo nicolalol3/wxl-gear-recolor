@@ -2,7 +2,7 @@
 
 Client-side gear recolor for **WarcraftXL** (WotLK 3.3.5a client DLL / module system).
 
-Pick a color per equipment slot (`/recolor`) and tint matching gear textures / ObjectComponent meshes. No server DB changes.
+Pick a color per equipment slot (`/recolor`) — **Solid** or **Selective** (from→to color rules). No server DB changes.
 
 ## Contents
 
@@ -24,12 +24,8 @@ Opt-out: create `WarcraftXL_gear-recolor.disable` next to `Wow.exe`.
 
 - **Body armor** (chest, legs, hands, …): colorize paletted `Item\TextureComponents\…` before CharComponent paste.
 - **3D attachments** (head, shoulders, weapons): live pixel-shader colorize on ObjectComponent draw.
-- Tint math: keep luminance (shading), apply picked RGB as chroma.
-
-## Current limitations
-
-- **Unequip / re-equip (or relog)** is often needed for body pieces to fully refresh the character composite. Live slider/picker updates try to replay pastes, but the atlas is not always live.
-- **Whole-texture tint only.** Trying to recolor *precise* colors / regions inside a texture (selective hue, per-material masks, etc.) leads to endless edge-case bugs on paletted WotLK gear. This module intentionally tints the full component.
+- Tint math: keep luminance (shading), apply picked RGB as chroma (selective uses soft match + neighbor cleanup on OC).
+- Enter-world prefers natural paste tint (char-select quality); logout flushes TextureCache backups so glue/relog do not reuse stale pointers.
 
 ## License
 
