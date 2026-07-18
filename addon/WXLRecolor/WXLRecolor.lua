@@ -1,7 +1,7 @@
 -- WXLRecolor: per-slot RGB colorize via ColorPicker.
 -- Slash: /recolor
 
-local ADDON_NAME = "WXLRecolor"
+local ADDON_NAME = ...
 WXLRecolorDB = WXLRecolorDB or {}
 
 local EQUIP_SLOTS = {
@@ -242,14 +242,23 @@ previewDriver:SetScript("OnUpdate", function(self, elapsed)
     previewAccum = 0
     previewDirty = false
     if frame:IsShown() then
+        if type(WXL_RecolorArmPreviewCapture) == "function" then
+            WXL_RecolorArmPreviewCapture()
+        end
         model:SetUnit("player")
         model:Dress()
         applyModelCamera()
+        if type(WXL_RecolorForceBodyRebuild) == "function" then
+            WXL_RecolorForceBodyRebuild()
+        end
     end
     self:Hide()
 end)
 
 queuePreviewRefresh = function()
+    if type(WXL_RecolorArmPreviewCapture) == "function" then
+        WXL_RecolorArmPreviewCapture()
+    end
     previewDirty = true
     previewAccum = 0
     previewDriver:Show()
@@ -301,9 +310,35 @@ copyToAllBtn:SetPoint("LEFT", pickBtn, "RIGHT", 8, 0)
 copyToAllBtn:SetText("To all")
 copyToAllBtn:Disable()
 
+local colorPickerMovable = false
+local function ensureColorPickerMovable()
+    if colorPickerMovable or not ColorPickerFrame then
+        return
+    end
+    colorPickerMovable = true
+    ColorPickerFrame:SetMovable(true)
+    ColorPickerFrame:SetClampedToScreen(true)
+
+    -- Header strip only: dragging the whole frame breaks hue/sat mouse input.
+    local drag = CreateFrame("Frame", nil, ColorPickerFrame)
+    drag:SetPoint("TOPLEFT", 6, -4)
+    drag:SetPoint("TOPRIGHT", -6, -4)
+    drag:SetHeight(24)
+    drag:EnableMouse(true)
+    drag:SetFrameLevel(ColorPickerFrame:GetFrameLevel() + 5)
+    drag:SetScript("OnMouseDown", function()
+        ColorPickerFrame:StartMoving()
+    end)
+    drag:SetScript("OnMouseUp", function()
+        ColorPickerFrame:StopMovingOrSizing()
+    end)
+end
+
 local function openColorPicker(slot)
     local c = getSlot(slot) or { r = 0.8, g = 0.2, b = 0.2 }
     local prev = { r = c.r, g = c.g, b = c.b }
+
+    ensureColorPickerMovable()
 
     ColorPickerFrame.func = function()
         local r, g, b = ColorPickerFrame:GetColorRGB()
@@ -470,6 +505,9 @@ makeBtn("Reset Slot", -208, function()
 end)
 
 frame:SetScript("OnShow", function()
+    if type(WXL_RecolorSetPreviewActive) == "function" then
+        WXL_RecolorSetPreviewActive(1)
+    end
     model:SetUnit("player")
     model:Dress()
     applyModelCamera()
@@ -480,6 +518,35 @@ frame:SetScript("OnShow", function()
     end
     refreshSlots()
     refreshColorPanel()
+    queuePreviewRefresh()
+end)
+
+frame:SetScript("OnHide", function()
+    if type(WXL_RecolorSetPreviewActive) == "function" then
+        WXL_RecolorSetPreviewActive(0)
+    end
+end)
+
+-- Default game paperdoll (CharacterModelFrame): arm UI OC root capture.
+local charHook = CreateFrame("Frame")
+charHook:RegisterEvent("PLAYER_LOGIN")
+charHook:SetScript("OnEvent", function(self)
+    self:UnregisterEvent("PLAYER_LOGIN")
+    if not CharacterFrame then
+        return
+    end
+    CharacterFrame:HookScript("OnShow", function()
+        if type(WXL_RecolorSetCharacterUiActive) == "function" then
+            WXL_RecolorSetCharacterUiActive(1)
+        elseif type(WXL_RecolorArmUiCapture) == "function" then
+            WXL_RecolorArmUiCapture()
+        end
+    end)
+    CharacterFrame:HookScript("OnHide", function()
+        if type(WXL_RecolorSetCharacterUiActive) == "function" then
+            WXL_RecolorSetCharacterUiActive(0)
+        end
+    end)
 end)
 
 SLASH_WXLRECOLOR1 = "/recolor"

@@ -12,6 +12,8 @@
 #include "events/EventScript.hpp"
 #include "game/gx/Gx.hpp"
 #include "game/m2/M2.hpp"
+#include "game/unit/Unit.hpp"
+#include "game/world/World.hpp"
 #include "offsets/engine/Gx.hpp"
 #include "runtime/LuaBindings.hpp"
 #include "runtime/ModuleInstall.hpp"
@@ -40,6 +42,13 @@ namespace
     constexpr size_t kOffInstModel = 0x2C;
     constexpr int kMaxEquipSlots = 19;
 
+    // CCharacterComponent::RenderPrep @ 0x4F1520 (thiscall). Proven via NPC-flag test at +0x3C.
+    constexpr uintptr_t kCharRenderPrep = 0x004F1520;
+    // Retail ComponentData: model @ +0x38, flags @ +0x3C (bit0 = NPC).
+    constexpr size_t kOffComponentModel = 0x38;
+    constexpr size_t kOffComponentFlags = 0x3C;
+    constexpr uint32_t kComponentFlagNpc = 0x1;
+
     // Fields named hue/sat/light for legacy call sites; values are RGB 0..1.
     struct SlotHsl
     {
@@ -48,6 +57,7 @@ namespace
         float sat = 1.f;   // G
         float light = 1.f; // B
     };
+
 
     std::mutex g_colorMutex;
     SlotHsl g_slotHsl[kMaxEquipSlots];
@@ -275,6 +285,499 @@ namespace
             }
         }
         return false;
+    }
+
+    // --- Player / preview scoping (tint must NOT leak to other units) ---
+
+    std::atomic<void*> g_localPlayerModel{ nullptr };
+    std::atomic<void*> g_previewModel{ nullptr };
+    std::atomic<void*> g_localPlayerComponent{ nullptr };
+    std::atomic<void*> g_previewComponent{ nullptr };
+    std::atomic<bool> g_previewUiActive{ false };
+    std::atomic<uint32_t> g_previewCaptureUntil{ 0 };
+    std::atomic<bool> g_forceAllowPaste{ false };
+    std::atomic<bool> g_assemblingAllowed{ false };
+    // Once we have matched unit->model == component.model, never use login optimism.
+    std::atomic<bool> g_playerModelLocked{ false };
+    // Retail: section loop at 0x4EE0D0 does `test [edi+0x0C], (1<<section)`.
+    // (whoa +0x04 is wrong here — +0x04 is a list link; +0x08 is m_flags.)
+    constexpr size_t kOffComponentSectionDirty = 0x0C;
+    // M2Instance+0x10 init flags (WXL M2.hpp); logged on UI root capture.
+    constexpr size_t kOffInstInitFlags = 0x10;
+
+    void* ComponentModel(void* component);
+    bool AnySlotActive();
+    bool ComponentIsNpc(void* component);
+
+    // Extra OC roots for paperdoll / char-select / DressUp clones (not world unit+0xB4).
+    constexpr int kMaxUiOcRoots = 12;
+    std::mutex g_uiRootMu;
+    void* g_uiOcRoots[kMaxUiOcRoots] = {};
+    int g_uiOcRootN = 0;
+    std::atomic<uint32_t> g_uiCaptureUntil{ 0 };
+    std::atomic<bool> g_characterUiActive{ false };
+    std::atomic<bool> g_pendingPreviewForce{ false };
+
+    void RegisterUiOcRoot(void* root)
+    {
+        if (!root)
+            return;
+        std::lock_guard<std::mutex> lock(g_uiRootMu);
+        for (int i = 0; i < g_uiOcRootN; ++i)
+        {
+            if (g_uiOcRoots[i] == root)
+                return;
+        }
+        if (g_uiOcRootN < kMaxUiOcRoots)
+            g_uiOcRoots[g_uiOcRootN++] = root;
+        else
+            g_uiOcRoots[0] = root;
+    }
+
+    void ClearUiOcRoots()
+    {
+        std::lock_guard<std::mutex> lock(g_uiRootMu);
+        g_uiOcRootN = 0;
+        for (int i = 0; i < kMaxUiOcRoots; ++i)
+            g_uiOcRoots[i] = nullptr;
+    }
+
+    bool IsUiCaptureArmed()
+    {
+        return GetTickCount() <= g_uiCaptureUntil.load(std::memory_order_relaxed);
+    }
+
+    void ArmUiCapture(uint32_t ms)
+    {
+        g_uiCaptureUntil.store(GetTickCount() + ms, std::memory_order_relaxed);
+    }
+
+    using CharRenderPrepFn = int(__thiscall*)(void* component, int a2);
+    CharRenderPrepFn g_origRenderPrep = nullptr;
+
+    void* SafeReadPtr(void* base, size_t off) noexcept
+    {
+        if (!base)
+            return nullptr;
+        __try
+        {
+            return *reinterpret_cast<void**>(static_cast<uint8_t*>(base) + off);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return nullptr;
+        }
+    }
+
+    uint32_t SafeReadU32(void* base, size_t off) noexcept
+    {
+        if (!base)
+            return 0;
+        __try
+        {
+            return *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(base) + off);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return 0;
+        }
+    }
+
+    void* LocalPlayerBodyModel()
+    {
+        const unsigned long long guid = wxl::game::world::ActivePlayerGuid();
+        if (!guid)
+            return nullptr;
+        void* unit = wxl::game::world::ResolveObject(
+            guid, wxl::game::world::kTypeMaskUnit | wxl::game::world::kTypeMaskPlayer);
+        void* model = wxl::game::unit::Model(unit);
+        g_localPlayerModel.store(model, std::memory_order_relaxed);
+        return model;
+    }
+
+    bool ModelInAllowedTree(void* instance)
+    {
+        if (!instance)
+            return false;
+
+        // Roots that may own ObjectComponents (helm/shoulder/weapon):
+        // unit+0xB4, sticky CharacterComponent.model, DressUp preview, and UI
+        // paperdoll / char-select clones captured into g_uiOcRoots.
+        void* roots[16] = {};
+        int n = 0;
+        auto addRoot = [&](void* p) {
+            if (!p || n >= 16)
+                return;
+            for (int i = 0; i < n; ++i)
+            {
+                if (roots[i] == p)
+                    return;
+            }
+            roots[n++] = p;
+        };
+        addRoot(LocalPlayerBodyModel());
+        addRoot(g_localPlayerModel.load(std::memory_order_relaxed));
+        addRoot(ComponentModel(g_localPlayerComponent.load(std::memory_order_relaxed)));
+        addRoot(g_previewModel.load(std::memory_order_relaxed));
+        {
+            std::lock_guard<std::mutex> lock(g_uiRootMu);
+            for (int i = 0; i < g_uiOcRootN; ++i)
+                addRoot(g_uiOcRoots[i]);
+        }
+        if (n == 0)
+            return false;
+
+        void* cur = instance;
+        for (int depth = 0; depth < 24 && cur; ++depth)
+        {
+            for (int i = 0; i < n; ++i)
+            {
+                if (cur == roots[i])
+                    return true;
+            }
+            cur = wxl::game::unit::ModelParent(cur);
+        }
+        return false;
+    }
+
+    // Paperdoll / shallow UI clones: parent chain often ends at p0 with p1==null.
+    bool TryCaptureUiOcRoot(void* instance)
+    {
+        if (!instance)
+            return false;
+        const bool uiOpen = g_characterUiActive.load(std::memory_order_relaxed)
+            || g_previewUiActive.load(std::memory_order_relaxed)
+            || IsUiCaptureArmed();
+        if (!uiOpen)
+            return false;
+        void* p0 = wxl::game::unit::ModelParent(instance);
+        if (!p0)
+            return false;
+        // Only shallow UI trees (paperdoll / DressUp), not world unit graphs.
+        if (wxl::game::unit::ModelParent(p0) != nullptr)
+            return false;
+        void* player = LocalPlayerBodyModel();
+        if (player && p0 == player)
+            return false;
+        RegisterUiOcRoot(p0);
+        return true;
+    }
+
+    bool ComponentIsNpc(void* component)
+    {
+        return (SafeReadU32(component, kOffComponentFlags) & kComponentFlagNpc) != 0;
+    }
+
+    void* ComponentModel(void* component)
+    {
+        return SafeReadPtr(component, kOffComponentModel);
+    }
+
+    bool IsPasteTintAllowed()
+    {
+        if (g_forceAllowPaste.load(std::memory_order_relaxed))
+            return true;
+        return g_assemblingAllowed.load(std::memory_order_relaxed);
+    }
+
+    void ClearPlayerScope()
+    {
+        g_localPlayerComponent.store(nullptr, std::memory_order_relaxed);
+        g_localPlayerModel.store(nullptr, std::memory_order_relaxed);
+        g_previewComponent.store(nullptr, std::memory_order_relaxed);
+        g_previewModel.store(nullptr, std::memory_order_relaxed);
+        g_playerModelLocked.store(false, std::memory_order_relaxed);
+        g_previewCaptureUntil.store(0, std::memory_order_relaxed);
+        g_pendingPreviewForce.store(false, std::memory_order_relaxed);
+        ClearUiOcRoots();
+    }
+
+    bool IsBodyEquipSlot(int slot)
+    {
+        return slot == 3 || slot == 4 || slot == 5
+            || slot == 6 || slot == 7 || slot == 8 || slot == 9;
+    }
+
+    // COMPONENT_SECTIONS bits used by RenderPrepSections @ 0x4EE0D0.
+    uint32_t SectionMaskForEquipSlot(int slot)
+    {
+        switch (slot)
+        {
+        case 3: case 4: // shirt / chest → torso upper+lower
+            return (1u << 3) | (1u << 4);
+        case 5: // waist / belt lives on leg-upper
+            return (1u << 5);
+        case 6: // legs
+            return (1u << 5) | (1u << 6);
+        case 7: // feet (boot_ll on leg-lower + foot)
+            return (1u << 6) | (1u << 7);
+        case 8: // wrists / arms
+            return (1u << 0) | (1u << 1);
+        case 9: // hands
+            return (1u << 1) | (1u << 2);
+        case -1: // full body rebuild
+            return 0x3FFu;
+        default:
+            return 0;
+        }
+    }
+
+    bool ComponentBelongsToLocalPlayer(void* component)
+    {
+        if (!component)
+            return false;
+        void* playerModel = LocalPlayerBodyModel();
+        if (!playerModel)
+            return false;
+        void* cm = ComponentModel(component);
+        return cm && cm == playerModel;
+    }
+
+    void ArmPreviewCapture(uint32_t ms)
+    {
+        const uint32_t now = GetTickCount();
+        g_previewCaptureUntil.store(now + ms, std::memory_order_relaxed);
+        g_previewUiActive.store(true, std::memory_order_relaxed);
+    }
+
+    void ForceComponentRebuild(void* component, uint32_t sectionMask)
+    {
+        if (!component || !g_origRenderPrep || sectionMask == 0)
+            return;
+        // Stale pointer after logout/relog → native RenderPrep crashes.
+        // Char-select has no ActivePlayerGuid — allow sticky local / preview.
+        const bool isPreview = (component == g_previewComponent.load(std::memory_order_relaxed));
+        const bool isStickyLocal = (component == g_localPlayerComponent.load(std::memory_order_relaxed));
+        if (!ComponentBelongsToLocalPlayer(component) && !isPreview && !isStickyLocal)
+        {
+            return;
+        }
+        // Preview component may outlive its model after DressUp teardown, or Dress
+        // may replace the model pointer — refresh sticky instead of wiping preview.
+        if (component == g_previewComponent.load(std::memory_order_relaxed))
+        {
+            void* cm = ComponentModel(component);
+            if (!cm)
+            {
+                g_previewComponent.store(nullptr, std::memory_order_relaxed);
+                g_previewModel.store(nullptr, std::memory_order_relaxed);
+                return;
+            }
+            g_previewModel.store(cm, std::memory_order_relaxed);
+        }
+        uint32_t dirtyBefore = 0;
+        __try
+        {
+            // GOOD PATH (keep): dirty section bits @ +0x0C then RenderPrep(a2=1).
+            // Use a per-slot mask — dirtying 0xFFFFFFFF re-pasted every body piece and
+            // caused cross-slot texture influence.
+            dirtyBefore = *reinterpret_cast<uint32_t*>(
+                static_cast<uint8_t*>(component) + kOffComponentSectionDirty);
+            *reinterpret_cast<uint32_t*>(
+                static_cast<uint8_t*>(component) + kOffComponentSectionDirty) = sectionMask;
+            *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(component) + 0x08) |= 0x1u;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return;
+        }
+        g_forceAllowPaste.store(true, std::memory_order_relaxed);
+        __try
+        {
+            g_origRenderPrep(component, 1);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            ClearPlayerScope();
+        }
+        g_forceAllowPaste.store(false, std::memory_order_relaxed);
+    }
+
+    void ForceAllowedBodyRebuildForSlot(int slot)
+    {
+        const uint32_t mask = SectionMaskForEquipSlot(slot);
+        if (mask == 0)
+            return;
+
+        void* playerModel = LocalPlayerBodyModel();
+        void* local = g_localPlayerComponent.load(std::memory_order_relaxed);
+        void* preview = g_previewComponent.load(std::memory_order_relaxed);
+
+        if (!playerModel)
+        {
+            // Char-select / glue: keep sticky component — do NOT ClearPlayerScope.
+            if (local && ComponentModel(local))
+            {
+                ForceComponentRebuild(local, mask);
+            }
+            if (preview && preview != local)
+                ForceComponentRebuild(preview, mask);
+            if (!local && !preview)
+                g_pendingPreviewForce.store(true, std::memory_order_relaxed);
+            return;
+        }
+
+        if (local && !ComponentBelongsToLocalPlayer(local))
+        {
+            g_localPlayerComponent.store(nullptr, std::memory_order_relaxed);
+            local = nullptr;
+        }
+        if (local)
+            ForceComponentRebuild(local, mask);
+        if (preview && preview != local)
+            ForceComponentRebuild(preview, mask);
+        else if (!preview && g_previewUiActive.load(std::memory_order_relaxed))
+            g_pendingPreviewForce.store(true, std::memory_order_relaxed);
+    }
+
+    // Back-compat wrapper used by Lua preview refresh (full body).
+    void ForceAllowedBodyRebuild()
+    {
+        ForceAllowedBodyRebuildForSlot(-1);
+    }
+
+    int __fastcall hkRenderPrep(void* component, void* /*edx*/, int a2)
+    {
+        bool allowed = false;
+        void* model = ComponentModel(component);
+        void* playerModel = LocalPlayerBodyModel();
+        const bool isNpc = ComponentIsNpc(component);
+        const uint32_t flags = SafeReadU32(component, kOffComponentFlags);
+        void* sticky = g_localPlayerComponent.load(std::memory_order_relaxed);
+        const bool locked = g_playerModelLocked.load(std::memory_order_relaxed);
+        const char* reason = "deny";
+
+        if (component && !isNpc)
+        {
+            if (playerModel && model && model == playerModel)
+            {
+                allowed = true;
+                reason = "player_model";
+                g_localPlayerComponent.store(component, std::memory_order_relaxed);
+                g_playerModelLocked.store(true, std::memory_order_relaxed);
+            }
+            else if (sticky && component == sticky)
+            {
+                // Stale after logout: sticky must still belong to the live player.
+                // Char-select / glue: no ActivePlayerGuid — keep optimism sticky.
+                if (playerModel && ComponentModel(sticky) == playerModel)
+                {
+                    allowed = true;
+                    reason = "sticky_component";
+                }
+                else if (!playerModel && model && model == ComponentModel(sticky))
+                {
+                    allowed = true;
+                    reason = "charselect_sticky";
+                    g_localPlayerModel.store(model, std::memory_order_relaxed);
+                }
+                else if (!playerModel && model)
+                {
+                    // Component model moved (char re-selected) — retarget sticky.
+                    allowed = true;
+                    reason = "charselect_retarget";
+                    g_localPlayerComponent.store(component, std::memory_order_relaxed);
+                    g_localPlayerModel.store(model, std::memory_order_relaxed);
+                }
+                else
+                {
+                    g_localPlayerComponent.store(nullptr, std::memory_order_relaxed);
+                    reason = "sticky_stale";
+                }
+            }
+            else if (!locked && !playerModel && model)
+            {
+                // Login/load only — never keep optimism after a locked world session.
+                allowed = true;
+                reason = "login_optimism";
+                g_localPlayerComponent.store(component, std::memory_order_relaxed);
+                g_localPlayerModel.store(model, std::memory_order_relaxed);
+            }
+            else
+            {
+                const uint32_t now = GetTickCount();
+                const uint32_t until = g_previewCaptureUntil.load(std::memory_order_relaxed);
+                if (g_previewUiActive.load(std::memory_order_relaxed) && now <= until && model)
+                {
+                    const void* prevModel = g_previewModel.load(std::memory_order_relaxed);
+                    g_previewModel.store(model, std::memory_order_relaxed);
+                    g_previewComponent.store(component, std::memory_order_relaxed);
+                    allowed = true;
+                    reason = "preview_capture";
+                    RegisterUiOcRoot(model);
+                    const bool pending = g_pendingPreviewForce.exchange(
+                        false, std::memory_order_relaxed);
+                    if ((pending || model != prevModel) && AnySlotActive())
+                    {
+                        // Dress often calls RenderPrep(a2=0) with clean sections — force
+                        // a body paste when preview model is (re)captured.
+                        __try
+                        {
+                            *reinterpret_cast<uint32_t*>(
+                                static_cast<uint8_t*>(component) + kOffComponentSectionDirty)
+                                |= SectionMaskForEquipSlot(-1);
+                            *reinterpret_cast<uint32_t*>(
+                                static_cast<uint8_t*>(component) + 0x08) |= 0x1u;
+                        }
+                        __except (EXCEPTION_EXECUTE_HANDLER)
+                        {
+                        }
+                    }
+                }
+                else if (model && model == g_previewModel.load(std::memory_order_relaxed))
+                {
+                    allowed = true;
+                    reason = "preview_model";
+                    g_previewComponent.store(component, std::memory_order_relaxed);
+                    RegisterUiOcRoot(model);
+                }
+                else if (!playerModel)
+                    reason = "no_player_model";
+                else if (!model)
+                    reason = "no_comp_model";
+                else
+                    reason = "model_mismatch";
+            }
+        }
+        else if (!component)
+            reason = "no_component";
+        else if (isNpc)
+            reason = "npc_flag";
+
+        if (!playerModel && locked)
+            ClearPlayerScope();
+
+        // Char-select: assembled models often arrive with clean section bits — dirty
+        // once per sticky model so body TextureComponents pick up saved colors.
+        if (allowed && !playerModel && AnySlotActive() && component && model)
+        {
+            static void* s_charselectDirtyModel = nullptr;
+            if (model != s_charselectDirtyModel)
+            {
+                s_charselectDirtyModel = model;
+                __try
+                {
+                    *reinterpret_cast<uint32_t*>(
+                        static_cast<uint8_t*>(component) + kOffComponentSectionDirty)
+                        |= SectionMaskForEquipSlot(-1);
+                    *reinterpret_cast<uint32_t*>(
+                        static_cast<uint8_t*>(component) + 0x08) |= 0x1u;
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER)
+                {
+                }
+            }
+        }
+
+        // Preview body refresh is driven by capture dirty + WXL_RecolorForceBodyRebuild.
+
+
+        g_assemblingAllowed.store(allowed, std::memory_order_relaxed);
+        const int rc = g_origRenderPrep
+            ? g_origRenderPrep(component, a2)
+            : 0;
+        g_assemblingAllowed.store(false, std::memory_order_relaxed);
+        return rc;
     }
 
     // --- Paste hooks: tint TextureComponents via TexTintCache orig backup ---
@@ -725,6 +1228,10 @@ namespace
         if (!bodySlot)
             return;
 
+        // Replay runs outside RenderPrep — force-allow so tint applies, then restore
+        // TextureCache so world units never see our modified shared sources.
+        g_forceAllowPaste.store(true, std::memory_order_relaxed);
+
         LivePaste copy[kMaxLivePastes];
         int n = 0;
         {
@@ -759,13 +1266,19 @@ namespace
                 ++ok;
             else
                 ++fail;
+
+            RestoreTextureCacheOrig(copy[i].src);
         }
+
+        g_forceAllowPaste.store(false, std::memory_order_relaxed);
+
     }
 
     void __cdecl hkPasteSkinLayout(int section, void* srcTexture, void* dstMips)
     {
         // 0x4F07D0: base skin laid into every body section — NEVER tint here.
-        if (srcTexture && dstMips)
+        // Only track layers while assembling the local player / DressUp preview.
+        if (srcTexture && dstMips && IsPasteTintAllowed())
             RememberLivePaste(section, srcTexture, dstMips, -2);
         if (g_origPasteToSection)
             g_origPasteToSection(section, srcTexture, dstMips);
@@ -773,7 +1286,12 @@ namespace
 
     void __cdecl hkPasteToSection(int section, void* srcTexture, void* dstMips)
     {
-        // 0x4F08A0: items / face / hair overlays — tint TextureComponents only.
+        // 0x4F08A0: items / face / hair overlays — tint TextureComponents only for
+        // the local player (or armed DressUp preview). Always restore the shared
+        // TextureCache after paste so other characters never inherit our palette.
+        const bool allow = IsPasteTintAllowed();
+        const bool force = g_forceAllowPaste.load(std::memory_order_relaxed);
+        bool didTint = false;
         if (srcTexture)
         {
             const char* name = TextureName(srcTexture);
@@ -784,17 +1302,23 @@ namespace
                 const bool hasHsl = TryHslForComponentTexture(name, hsl, &slot);
                 if (slot < 0)
                     slot = SlotForComponentTexture(name);
-                if (slot >= 0)
+                if (allow && slot >= 0)
                     RememberLivePaste(section, srcTexture, dstMips, slot);
-                if (hasHsl)
+                if (allow && hasHsl)
                 {
                     const char* mode = "none";
                     const bool ok = TintTextureCacheForPaste(srcTexture, name, hsl, slot, &mode);
+                    didTint = ok;
+                }
+                else
+                {
                 }
             }
         }
         if (g_origPasteFromSkin)
             g_origPasteFromSkin(section, srcTexture, dstMips);
+        if (didTint)
+            RestoreTextureCacheOrig(srcTexture);
     }
 
     void NotifyOcSlotChanged(int slot)
@@ -817,7 +1341,13 @@ namespace
             g_slotHsl[slot] = h;
         }
         NotifyOcSlotChanged(slot);
-        ReplayLivePastesForSlot(slot);
+        if (g_previewUiActive.load(std::memory_order_relaxed))
+            ArmPreviewCapture(800);
+        // Body: per-slot dirty + RenderPrep (good live path). Do NOT ReplayLivePastes —
+        // that painted the shared staging buffer for every layer and cross-influenced slots.
+        // OC slots: mesh PS only — never force a full body rebuild.
+        if (IsBodyEquipSlot(slot))
+            ForceAllowedBodyRebuildForSlot(slot);
         SaveHslToDisk();
     }
 
@@ -830,7 +1360,10 @@ namespace
             g_slotHsl[slot] = {};
         }
         NotifyOcSlotChanged(slot);
-        ReplayLivePastesForSlot(slot);
+        if (g_previewUiActive.load(std::memory_order_relaxed))
+            ArmPreviewCapture(800);
+        if (IsBodyEquipSlot(slot))
+            ForceAllowedBodyRebuildForSlot(slot);
         SaveHslToDisk();
     }
 
@@ -842,7 +1375,7 @@ namespace
                 g_slotHsl[i] = {};
         }
         g_ocPixelTintLive.store(false, std::memory_order_relaxed);
-        ReplayLivePastesForSlot(-1);
+        ForceAllowedBodyRebuildForSlot(-1);
         SaveHslToDisk();
     }
 
@@ -1198,6 +1731,79 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
         return 0;
     }
 
+    int __cdecl LuaRecolorSetPreviewActive(void* state)
+    {
+        const bool active = state && wlua::ToNumber(state, 1) != 0.0;
+        g_previewUiActive.store(active, std::memory_order_relaxed);
+        if (!active)
+        {
+            g_previewCaptureUntil.store(0, std::memory_order_relaxed);
+            g_previewModel.store(nullptr, std::memory_order_relaxed);
+            g_previewComponent.store(nullptr, std::memory_order_relaxed);
+        }
+        else
+            ArmPreviewCapture(1500);
+        if (active)
+            ArmUiCapture(1500);
+        if (state)
+        {
+            wlua::PushBoolean(state, 1);
+            return 1;
+        }
+        return 0;
+    }
+
+    int __cdecl LuaRecolorArmPreviewCapture(void* state)
+    {
+        ArmPreviewCapture(800);
+        ArmUiCapture(800);
+        if (state)
+        {
+            wlua::PushBoolean(state, 1);
+            return 1;
+        }
+        return 0;
+    }
+
+    int __cdecl LuaRecolorArmUiCapture(void* state)
+    {
+        ArmUiCapture(2000);
+        g_characterUiActive.store(true, std::memory_order_relaxed);
+        if (state)
+        {
+            wlua::PushBoolean(state, 1);
+            return 1;
+        }
+        return 0;
+    }
+
+    int __cdecl LuaRecolorSetCharacterUiActive(void* state)
+    {
+        const bool active = state && wlua::ToNumber(state, 1) != 0.0;
+        g_characterUiActive.store(active, std::memory_order_relaxed);
+        if (active)
+            ArmUiCapture(2000);
+        else
+            ClearUiOcRoots();
+        if (state)
+        {
+            wlua::PushBoolean(state, 1);
+            return 1;
+        }
+        return 0;
+    }
+
+    int __cdecl LuaRecolorForceBodyRebuild(void* state)
+    {
+        ForceAllowedBodyRebuild();
+        if (state)
+        {
+            wlua::PushBoolean(state, 1);
+            return 1;
+        }
+        return 0;
+    }
+
     class GearRecolor final : public ev::EventScript
     {
     public:
@@ -1215,6 +1821,11 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
             wlua::RegisterFunction("WXL_RecolorBakePreview", &LuaRecolorBakePreview);
             wlua::RegisterFunction("WXL_RecolorClearSlot", &LuaRecolorClearSlot);
             wlua::RegisterFunction("WXL_RecolorClearAll", &LuaRecolorClearAll);
+            wlua::RegisterFunction("WXL_RecolorSetPreviewActive", &LuaRecolorSetPreviewActive);
+            wlua::RegisterFunction("WXL_RecolorArmPreviewCapture", &LuaRecolorArmPreviewCapture);
+            wlua::RegisterFunction("WXL_RecolorArmUiCapture", &LuaRecolorArmUiCapture);
+            wlua::RegisterFunction("WXL_RecolorSetCharacterUiActive", &LuaRecolorSetCharacterUiActive);
+            wlua::RegisterFunction("WXL_RecolorForceBodyRebuild", &LuaRecolorForceBodyRebuild);
 
             LoadHslFromDisk();
 
@@ -1228,6 +1839,15 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
         {
             if (a.phase != 1 || !a.model || !a.device || !AnySlotActive())
                 return;
+
+            // ObjectComponents (helm/shoulder/weapon): only tint meshes under the
+            // local player or the armed DressUp preview — never other PCs/NPCs.
+            if (!ModelInAllowedTree(a.model))
+            {
+                // Paperdoll / DressUp: shallow UI roots registered on first OC draw.
+                if (!TryCaptureUiOcRoot(a.model) || !ModelInAllowedTree(a.model))
+                    return;
+            }
 
             void* model = ResolveM2Model(a.model);
             const char* stem = model ? m2::PathStem(model) : nullptr;
@@ -1344,8 +1964,12 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
             wxl::offsets::engine::gx::kCharPasteFromSkin,
             reinterpret_cast<void*>(&hkPasteToSection),
             reinterpret_cast<void**>(&g_origPasteFromSkin));
-        WLOG_INFO("gear-recolor: paste hooks skinLayout=%d itemPaste=%d",
-            okSkinLayout ? 1 : 0, okItemPaste ? 1 : 0);
+        const bool okRenderPrep = wxl::core::hook::Install("GearRecolor_RenderPrep",
+            kCharRenderPrep,
+            reinterpret_cast<void*>(&hkRenderPrep),
+            reinterpret_cast<void**>(&g_origRenderPrep));
+        WLOG_INFO("gear-recolor: paste hooks skinLayout=%d itemPaste=%d renderPrep=%d",
+            okSkinLayout ? 1 : 0, okItemPaste ? 1 : 0, okRenderPrep ? 1 : 0);
     }
 
     struct PasteHookInstaller
