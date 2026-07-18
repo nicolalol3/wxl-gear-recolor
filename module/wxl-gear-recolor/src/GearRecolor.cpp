@@ -646,6 +646,9 @@ namespace
     std::atomic<uint32_t> g_previewCaptureUntil{ 0 };
     std::atomic<bool> g_forceAllowPaste{ false };
     std::atomic<bool> g_assemblingAllowed{ false };
+    // Set for the duration of hkRenderPrep / forced rebuild — paste tint must
+    // only run when this matches the local player model (never other PCs).
+    std::atomic<void*> g_prepModel{ nullptr };
     // Once we have matched unit->model == component.model, never use login optimism.
     std::atomic<bool> g_playerModelLocked{ false };
     // Retail: section loop at 0x4EE0D0 does `test [edi+0x0C], (1<<section)`.
@@ -752,6 +755,13 @@ namespace
         if (!instance)
             return false;
 
+        // World: prefer live local player model root. Never tint OC for units
+        // that merely share item paths (same helm/shoulder/weapon as you).
+        // Glue / char-select: ActivePlayerGuid is null — still allow the sticky
+        // CharacterComponent model so helm/shoulder/weapon tint on enter-world.
+        // (Body paste already uses sticky; OC used to miss it after world gate.)
+        void* playerModel = LocalPlayerBodyModel();
+
         // Roots that may own ObjectComponents (helm/shoulder/weapon):
         // unit+0xB4, sticky CharacterComponent.model, DressUp preview, and UI
         // paperdoll / char-select clones captured into g_uiOcRoots.
@@ -767,9 +777,18 @@ namespace
             }
             roots[n++] = p;
         };
-        addRoot(LocalPlayerBodyModel());
-        addRoot(g_localPlayerModel.load(std::memory_order_relaxed));
-        addRoot(ComponentModel(g_localPlayerComponent.load(std::memory_order_relaxed)));
+        if (playerModel)
+        {
+            addRoot(playerModel);
+            addRoot(g_localPlayerModel.load(std::memory_order_relaxed));
+            addRoot(ComponentModel(g_localPlayerComponent.load(std::memory_order_relaxed)));
+        }
+        else
+        {
+            // Char-select / enter-world screen only (no world unit yet).
+            addRoot(g_localPlayerModel.load(std::memory_order_relaxed));
+            addRoot(ComponentModel(g_localPlayerComponent.load(std::memory_order_relaxed)));
+        }
         addRoot(g_previewModel.load(std::memory_order_relaxed));
         {
             std::lock_guard<std::mutex> lock(g_uiRootMu);
@@ -827,9 +846,20 @@ namespace
 
     bool IsPasteTintAllowed()
     {
-        if (g_forceAllowPaste.load(std::memory_order_relaxed))
-            return true;
-        return g_assemblingAllowed.load(std::memory_order_relaxed);
+        if (!g_forceAllowPaste.load(std::memory_order_relaxed)
+            && !g_assemblingAllowed.load(std::memory_order_relaxed))
+            return false;
+
+        // Hard world gate: even if sticky/optimism wrongly allowed another unit's
+        // CharComponent, never mutate TextureCache for non-local assemblies.
+        void* pm = LocalPlayerBodyModel();
+        if (pm)
+        {
+            void* prep = g_prepModel.load(std::memory_order_relaxed);
+            if (!prep || prep != pm)
+                return false;
+        }
+        return true;
     }
 
     void ClearPlayerScope()
@@ -941,6 +971,7 @@ namespace
             return;
         }
         g_forceAllowPaste.store(true, std::memory_order_relaxed);
+        g_prepModel.store(ComponentModel(component), std::memory_order_relaxed);
         __try
         {
             g_origRenderPrep(component, 1);
@@ -949,7 +980,11 @@ namespace
         {
             ClearPlayerScope();
         }
+        // Always drop force-allow — a stuck true tints every subsequent paste
+        // (other players / skin overlays sharing TextureCache).
         g_forceAllowPaste.store(false, std::memory_order_relaxed);
+        g_assemblingAllowed.store(false, std::memory_order_relaxed);
+        g_prepModel.store(nullptr, std::memory_order_relaxed);
     }
 
     void ForceAllowedBodyRebuildForSlot(int slot)
@@ -1096,13 +1131,19 @@ namespace
                     reason = "sticky_stale";
                 }
             }
-            else if (!locked && !playerModel && model)
+            else if (!locked && !playerModel && model && !sticky)
             {
-                // Login/load only — never keep optimism after a locked world session.
+                // Glue one-shot ONLY when we have no sticky yet. Never re-enter
+                // optimism for other CharComponents — that tinted every loading
+                // unit's TextureComponents (other PCs / shared cache corruption).
                 allowed = true;
                 reason = "login_optimism";
                 g_localPlayerComponent.store(component, std::memory_order_relaxed);
                 g_localPlayerModel.store(model, std::memory_order_relaxed);
+            }
+            else if (!locked && !playerModel && model && sticky && component != sticky)
+            {
+                reason = "glue_other_deny";
             }
             else
             {
@@ -1183,11 +1224,13 @@ namespace
         // Preview body refresh is driven by capture dirty + WXL_RecolorForceBodyRebuild.
 
 
+        g_prepModel.store(model, std::memory_order_relaxed);
         g_assemblingAllowed.store(allowed, std::memory_order_relaxed);
         const int rc = g_origRenderPrep
             ? g_origRenderPrep(component, a2)
             : 0;
         g_assemblingAllowed.store(false, std::memory_order_relaxed);
+        g_prepModel.store(nullptr, std::memory_order_relaxed);
 
         // After world player locks: if natural paste already tinted (char-select
         // quality path), do NOT ForceComponentRebuild — that was the "adjustment"
@@ -1228,6 +1271,9 @@ namespace
 
     std::mutex g_texMutex;
     std::unordered_map<void*, std::string> g_texNames;
+    // Serialize all CharComponent pastes so a tinted shared TextureCache cannot be
+    // sampled into another unit's composite mid tint→paste→restore (skin/bg leak).
+    std::recursive_mutex g_pasteGateMu;
 
     struct TexTintCache
     {
@@ -1288,6 +1334,9 @@ namespace
     bool IsItemComponentTexture(const char* name)
     {
         if (!name || !name[0])
+            return false;
+        // Never touch character skin / face / hair caches (shared across units).
+        if (ContainsCI(name, "character\\") || ContainsCI(name, "character/"))
             return false;
         return ContainsCI(name, "item\\texturecomponents")
             || ContainsCI(name, "item/texturecomponents");
@@ -1426,36 +1475,16 @@ namespace
     void FlushTexTintState(const char* reason)
     {
         size_t cacheN = 0;
-        int restored = 0;
         int liveN = 0;
         {
             std::lock_guard<std::mutex> lock(g_texMutex);
             cacheN = g_texTint.size();
-            for (auto& kv : g_texTint)
-            {
-                void* tex = kv.first;
-                TexTintCache& st = kv.second;
-                if (st.orig.empty())
-                    continue;
-                if (st.paletted)
-                {
-                    uint8_t* pal = SafeGetPal(tex);
-                    if (pal && st.orig.size() >= 256 * 4)
-                    {
-                        std::memcpy(pal, st.orig.data(), 256 * 4);
-                        ++restored;
-                    }
-                }
-                else
-                {
-                    uint8_t* mip0 = SafeGetMip(tex, 0);
-                    if (mip0 && !st.orig.empty())
-                    {
-                        std::memcpy(mip0, st.orig.data(), st.orig.size());
-                        ++restored;
-                    }
-                }
-            }
+            // NEVER memcpy orig back through cached void* here.
+            // On logout/leave-world those handles are often freed and the addresses
+            // reused (sky, skin, other BLPs). Writing "palette orig" into the wrong
+            // object permanently corrupts the shared TextureCache until client restart
+            // — matches "other PCs + background exploded, still broken when I log them".
+            // Live paste path already restores while the pointer is still valid.
             g_texTint.clear();
             g_texNames.clear();
         }
@@ -1847,6 +1876,11 @@ namespace
 
         // Replay runs outside RenderPrep — force-allow so tint applies, then restore
         // TextureCache so world units never see our modified shared sources.
+        std::lock_guard<std::recursive_mutex> gate(g_pasteGateMu);
+        void* pm = LocalPlayerBodyModel();
+        if (!pm)
+            pm = ComponentModel(g_localPlayerComponent.load(std::memory_order_relaxed));
+        g_prepModel.store(pm, std::memory_order_relaxed);
         g_forceAllowPaste.store(true, std::memory_order_relaxed);
 
         LivePaste copy[kMaxLivePastes];
@@ -1884,17 +1918,20 @@ namespace
             else
                 ++fail;
 
+            // Unconditional restore after every tinted replay paste.
             RestoreTextureCacheOrig(copy[i].src);
         }
 
         g_forceAllowPaste.store(false, std::memory_order_relaxed);
-
+        g_assemblingAllowed.store(false, std::memory_order_relaxed);
+        g_prepModel.store(nullptr, std::memory_order_relaxed);
     }
 
     void __cdecl hkPasteSkinLayout(int section, void* srcTexture, void* dstMips)
     {
         // 0x4F07D0: base skin laid into every body section — NEVER tint here.
         // Only track layers while assembling the local player / DressUp preview.
+        std::lock_guard<std::recursive_mutex> gate(g_pasteGateMu);
         if (srcTexture && dstMips && IsPasteTintAllowed())
             RememberLivePaste(section, srcTexture, dstMips, -2);
         if (g_origPasteToSection)
@@ -1906,9 +1943,10 @@ namespace
         // 0x4F08A0: items / face / hair overlays — tint TextureComponents only for
         // the local player (or armed DressUp preview). Always restore the shared
         // TextureCache after paste so other characters never inherit our palette.
+        std::lock_guard<std::recursive_mutex> gate(g_pasteGateMu);
         const bool allow = IsPasteTintAllowed();
-        const bool force = g_forceAllowPaste.load(std::memory_order_relaxed);
         bool didTint = false;
+        const char* tintName = nullptr;
         if (srcTexture)
         {
             const char* name = TextureName(srcTexture);
@@ -1926,18 +1964,39 @@ namespace
                     const char* mode = "none";
                     const bool ok = TintTextureCacheForPaste(srcTexture, name, hsl, slot, &mode);
                     didTint = ok;
+                    tintName = name;
                     if (ok && !g_forceAllowPaste.load(std::memory_order_relaxed))
                         g_naturalTintPastes.fetch_add(1, std::memory_order_relaxed);
-                }
-                else
-                {
                 }
             }
         }
         if (g_origPasteFromSkin)
             g_origPasteFromSkin(section, srcTexture, dstMips);
         if (didTint)
-            RestoreTextureCacheOrig(srcTexture);
+        {
+            const bool restored = RestoreTextureCacheOrig(srcTexture);
+            int mismatch = -1;
+            if (restored && srcTexture)
+            {
+                std::lock_guard<std::mutex> lock(g_texMutex);
+                auto it = g_texTint.find(srcTexture);
+                if (it != g_texTint.end() && !it->second.orig.empty())
+                {
+                    if (it->second.paletted)
+                    {
+                        uint8_t* pal = SafeGetPal(srcTexture);
+                        mismatch = (pal && std::memcmp(pal, it->second.orig.data(),
+                            (std::min)(it->second.orig.size(), size_t{ 256 * 4 })) == 0) ? 0 : 1;
+                    }
+                    else
+                    {
+                        uint8_t* mip0 = SafeGetMip(srcTexture, 0);
+                        mismatch = (mip0 && std::memcmp(mip0, it->second.orig.data(),
+                            it->second.orig.size()) == 0) ? 0 : 1;
+                    }
+                }
+            }
+        }
     }
 
     void NotifyOcSlotChanged(int slot)
@@ -2076,8 +2135,9 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
 }
 )";
 
-    // Selective OC PS v8: normalized-RGB soft match + 4-neighbor despeckle.
-    // (v6 full HSV failed SM2; v7 soft RGB still speckled on AA edges.)
+    // Selective OC PS v10: lighting-robust chromaticity match (norm-RGB).
+    // Evidence: v9 compiled+ran (usePs:1) but weapons looked unchanged — screen
+    // eyedropper src includes lighting; absolute RGB dist never matched albedo.
     constexpr char kSelectivePsHlsl[] = R"(
 sampler2D s0 : register(s0);
 float4 c0 : register(c0);
@@ -2090,59 +2150,36 @@ float4 c6 : register(c6);
 float4 c7 : register(c7);
 float4 c8 : register(c8);
 
-float matchW(float3 c, float3 src, float tol)
+float3 applyRule(float3 c, float3 src, float3 dst, float tol)
 {
     float mx = max(c.r, max(c.g, c.b));
     float mn = min(c.r, min(c.g, c.b));
-    if (mx < 0.07) return 0.0;
+    if (mx < 0.04) return c;
     float sat = (mx - mn) / mx;
-    if (sat < 0.10) return 0.0;
+    if (sat < 0.05) return c;
     float smx = max(src.r, max(src.g, src.b));
-    if (smx < 0.07) return 0.0;
+    if (smx < 0.04) return c;
     float3 n = c / mx;
     float3 ns = src / smx;
     float dist = sqrt(dot(n - ns, n - ns));
-    float maxd = 0.045 + saturate(tol) * 0.90;
-    if (dist >= maxd) return 0.0;
-    float t = saturate((dist - maxd * 0.30) / max(0.001, maxd * 0.70));
+    // Wide gate: eyedropper src is lit; norm-RGB still drifts.
+    float maxd = 0.12 + saturate(tol) * 1.35;
+    if (dist >= maxd) return c;
+    float t = saturate(dist / maxd);
     float w = 1.0 - (t * t * (3.0 - 2.0 * t));
-    float satT = saturate((sat - 0.10) / 0.12);
-    w *= satT * satT * (3.0 - 2.0 * satT);
-    float glow = saturate((mx - 0.84) / 0.13) * saturate((sat - 0.35) / 0.35);
-    return saturate(w * (1.0 - glow * 0.92));
-}
-
-float3 applyRule(float3 c, float2 uv, float3 src, float3 dst, float tol)
-{
-    float w0 = matchW(c, src, tol);
-    float dx = 0.00390625; // 1/256 — neighbor consensus / despeckle
-    float nsum = matchW(tex2D(s0, uv + float2(dx, 0)).rgb, src, tol)
-               + matchW(tex2D(s0, uv + float2(-dx, 0)).rgb, src, tol)
-               + matchW(tex2D(s0, uv + float2(0, dx)).rgb, src, tol)
-               + matchW(tex2D(s0, uv + float2(0, -dx)).rgb, src, tol);
-    float navg = nsum * 0.25;
-    if (w0 > 0.35 && navg < 0.16) w0 = 0.0;
-    else if (w0 < 0.20 && navg > 0.55) w0 = navg * 0.70;
-    else
-    {
-        float ct = saturate((navg - 0.12) / 0.30);
-        w0 *= 0.25 + 0.75 * (ct * ct * (3.0 - 2.0 * ct));
-    }
-    w0 = saturate(w0);
-    if (w0 <= 0.001) return c;
     float lum = dot(c, float3(0.299, 0.587, 0.114));
     float dl = dot(dst, float3(0.299, 0.587, 0.114));
     float3 repl = (dl > 0.001) ? saturate(dst * (lum / dl)) : saturate(dst * lum);
-    return saturate(lerp(c, repl, w0));
+    return saturate(lerp(c, repl, w));
 }
 
 float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
 {
     float4 t = tex2D(s0, uv);
     float3 colored = t.rgb;
-    if (c0.a >= 0.5) colored = applyRule(colored, uv, c1.rgb, c2.rgb, c1.a);
-    if (c0.a >= 1.5) colored = applyRule(colored, uv, c3.rgb, c4.rgb, c3.a);
-    if (c0.a >= 2.5) colored = applyRule(colored, uv, c5.rgb, c6.rgb, c5.a);
+    if (c0.a >= 0.5) colored = applyRule(colored, c1.rgb, c2.rgb, c1.a);
+    if (c0.a >= 1.5) colored = applyRule(colored, c3.rgb, c4.rgb, c3.a);
+    if (c0.a >= 2.5) colored = applyRule(colored, c5.rgb, c6.rgb, c5.a);
     float3 outRgb = saturate(colored * diff.rgb);
     return float4(outRgb, saturate(t.a * diff.a));
 }
@@ -2175,7 +2212,7 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
     {
         static IDirect3DPixelShader9* ps = nullptr;
         static int compiledVer = 0;
-        constexpr int kPsVer = 8; // v8: norm-RGB + neighbor despeckle
+        constexpr int kPsVer = 10; // v10: norm-RGB match (eyedropper lighting-safe)
         if (compiledVer == kPsVer)
             return ps;
         compiledVer = kPsVer;
@@ -2888,6 +2925,16 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
             if (a.phase != 1 || !a.model || !a.device || !AnySlotActive())
                 return;
 
+            // Drop stale paperdoll OC roots when no UI is open — freed pointers can
+            // be reused by world units and would wrongly pass ModelInAllowedTree.
+            if (!g_characterUiActive.load(std::memory_order_relaxed)
+                && !g_previewUiActive.load(std::memory_order_relaxed)
+                && !IsUiCaptureArmed())
+            {
+                if (g_uiOcRootN > 0)
+                    ClearUiOcRoots();
+            }
+
             // ObjectComponents (helm/shoulder/weapon): only tint meshes under the
             // local player or the armed DressUp preview — never other PCs/NPCs.
             if (!ModelInAllowedTree(a.model))
@@ -2907,6 +2954,7 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
             if (!TryHslForPath(stem, hsl, &usedSlot))
                 return;
 
+
             // Always live mesh for OC — upload bake is one-shot and skips live Hue.
             RedrawTinted(a, hsl);
         }
@@ -2922,6 +2970,9 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
             {
                 std::lock_guard<std::mutex> lock(g_texMutex);
                 g_texNames[a.handle] = a.name;
+                // Fresh BLP bytes — drop any stale orig keyed by this handle so we
+                // never restore a previous item's palette into a reused pointer.
+                g_texTint.erase(a.handle);
             }
         }
 
@@ -3015,14 +3066,28 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
                         }
                     }
                     consts[0][3] = static_cast<float>(nRules);
+                    float oldConsts[9][4] = {};
+                    dev->GetPixelShaderConstantF(0, &oldConsts[0][0], 9);
                     dev->SetPixelShader(tintPs);
                     dev->SetPixelShaderConstantF(0, &consts[0][0], 9);
+                    gx::Device9(a.device).DrawIndexedPrimitive(
+                        a.primType, a.baseVertex, a.minIndex, a.numVerts,
+                        a.startIndex, a.primCount);
+                    // Critical: leaked c0..c8 corrupt later world/other-unit draws
+                    // (skin/background "exploded") until client restart.
+                    dev->SetPixelShaderConstantF(0, &oldConsts[0][0], 9);
                 }
                 else
                 {
                     const float c0[4] = { hsl.hue, hsl.sat, hsl.light, 1.f };
+                    float oldC0[4] = {};
+                    dev->GetPixelShaderConstantF(0, oldC0, 1);
                     dev->SetPixelShader(tintPs);
                     dev->SetPixelShaderConstantF(0, c0, 1);
+                    gx::Device9(a.device).DrawIndexedPrimitive(
+                        a.primType, a.baseVertex, a.minIndex, a.numVerts,
+                        a.startIndex, a.primCount);
+                    dev->SetPixelShaderConstantF(0, oldC0, 1);
                 }
             }
             else
@@ -3037,10 +3102,10 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
                 dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_TFACTOR);
                 dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
                 dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+                gx::Device9(a.device).DrawIndexedPrimitive(
+                    a.primType, a.baseVertex, a.minIndex, a.numVerts,
+                    a.startIndex, a.primCount);
             }
-
-            gx::Device9(a.device).DrawIndexedPrimitive(
-                a.primType, a.baseVertex, a.minIndex, a.numVerts, a.startIndex, a.primCount);
 
             if (!usePs)
             {

@@ -26,6 +26,7 @@ Opt-out: create `WarcraftXL_gear-recolor.disable` next to `Wow.exe`.
 - **3D attachments** (head, shoulders, weapons): live pixel-shader colorize on ObjectComponent draw.
 - Tint math: keep luminance (shading), apply picked RGB as chroma (selective uses soft match + neighbor cleanup on OC).
 - Enter-world prefers natural paste tint (char-select quality); logout flushes TextureCache backups so glue/relog do not reuse stale pointers.
+- Glue scoping: body tint is sticky/one-shot on the local CharacterComponent only; 3D gear (head/shoulder/weapon) uses the same sticky root on char-select and the live player model in-world.
 
 ## License
 
