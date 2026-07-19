@@ -2,14 +2,19 @@
 // Copyright (C) 2026. GPLv3 (see WarcraftXL LICENSE).
 //
 // Lua API:
-//   WXL_RecolorSetSlot(slot, r, g, b)   solid rgb 0..1
+//   WXL_RecolorSetSlot(slot, r, g, b)   solid single rgb 0..1
+//   WXL_RecolorSetSlotGradient(slot, nStops, fill, ...rgb)
+//     nStops=2|3|5; fill=0 auto (1 rgb base) | 1 custom (nStops rgb)
 //   WXL_RecolorSetSlotSelective(slot, sr,sg,sb, dr,dg,db, tol [, forceAppend])
 //   WXL_RecolorGetSlot(slot) -> r,g,b,active,mode,sr,sg,sb,tol,ruleCount
+//   WXL_RecolorGetSlotGradient(slot) -> active,nStops,fill, then nStops*rgb
 //   WXL_RecolorBeginBatch / WXL_RecolorEndBatch([forceRebuild])
 //   WXL_RecolorFlushTex()  — logout / leave-world TextureCache reset
 //   WXL_RecolorForceBodyRebuild / WXL_RecolorClearSlot / WXL_RecolorClearAll
+//   WXL_RecolorCatchSlotColors(slot) -> n, then n*(r,g,b)  (selective Catch)
 //   WXL_RecolorArmScreenSample / GetScreenSample / CancelScreenSample
-// State file: slot mode ...  (legacy "slot r g b" still loads as solid)
+// State: mode 0 solid single, 1 selective, 2 solid gradient
+//   (legacy "slot r g b" still loads as solid single)
 
 #include "core/Logger.hpp"
 #include "core/Hook.hpp"
@@ -53,9 +58,21 @@ namespace
     constexpr size_t kOffComponentFlags = 0x3C;
     constexpr uint32_t kComponentFlagNpc = 0x1;
 
-    // Fields named hue/sat/light for legacy call sites; values are RGB 0..1 (solid dest).
-    // mode 0 = solid (lum * dest), mode 1 = selective (chained src→dst rules).
+    float Clamp01(float v)
+    {
+        if (v < 0.f)
+            return 0.f;
+        if (v > 1.f)
+            return 1.f;
+        return v;
+    }
+
+    // Fields named hue/sat/light for legacy call sites; values are RGB 0..1.
+    // mode 0 = solid single (lum * dest)
+    // mode 1 = selective (chained src→dst rules)
+    // mode 2 = solid gradient (luminance samples 2/3/5 stop colors)
     constexpr int kMaxSelRules = 4;
+    constexpr int kMaxGradStops = 5;
     struct SelRule
     {
         float sr = 0.8f, sg = 0.2f, sb = 0.2f;
@@ -65,8 +82,8 @@ namespace
     struct SlotHsl
     {
         bool active = false;
-        uint8_t mode = 0; // 0 solid, 1 selective
-        float hue = 1.f;   // solid dest R (also mirrors last selective dest)
+        uint8_t mode = 0; // 0 solid single, 1 selective, 2 solid gradient
+        float hue = 1.f;   // solid dest / gradient base / last selective dest R
         float sat = 1.f;
         float light = 1.f;
         float srcR = 0.8f; // mirrors last selective src (GetSlot / UI)
@@ -75,7 +92,114 @@ namespace
         float tolerance = 0.35f;
         SelRule rules[kMaxSelRules] = {};
         uint8_t ruleCount = 0;
+        uint8_t stopCount = 1; // gradient: 2, 3, or 5
+        uint8_t gradFill = 0;  // 0 auto shades from hue/sat/light, 1 custom stops
+        float stops[kMaxGradStops][3] = {};
     };
+
+    void FillAutoStops(float br, float bg, float bb, int n, float outStops[kMaxGradStops][3])
+    {
+        if (n < 2)
+            n = 2;
+        if (n > kMaxGradStops)
+            n = kMaxGradStops;
+        const float darkR = Clamp01(br * 0.16f);
+        const float darkG = Clamp01(bg * 0.16f);
+        const float darkB = Clamp01(bb * 0.16f);
+        const float litR = Clamp01(br + (1.f - br) * 0.78f);
+        const float litG = Clamp01(bg + (1.f - bg) * 0.78f);
+        const float litB = Clamp01(bb + (1.f - bb) * 0.78f);
+        for (int i = 0; i < n; ++i)
+        {
+            const float t = (n <= 1) ? 0.5f
+                : static_cast<float>(i) / static_cast<float>(n - 1);
+            float r, g, b;
+            if (t <= 0.5f)
+            {
+                const float u = t * 2.f;
+                r = darkR + (br - darkR) * u;
+                g = darkG + (bg - darkG) * u;
+                b = darkB + (bb - darkB) * u;
+            }
+            else
+            {
+                const float u = (t - 0.5f) * 2.f;
+                r = br + (litR - br) * u;
+                g = bg + (litG - bg) * u;
+                b = bb + (litB - bb) * u;
+            }
+            outStops[i][0] = Clamp01(r);
+            outStops[i][1] = Clamp01(g);
+            outStops[i][2] = Clamp01(b);
+        }
+    }
+
+    void ResolveSolidStops(SlotHsl& h)
+    {
+        if (h.mode != 2)
+        {
+            h.stopCount = 1;
+            h.stops[0][0] = h.hue;
+            h.stops[0][1] = h.sat;
+            h.stops[0][2] = h.light;
+            return;
+        }
+        int n = h.stopCount;
+        if (n != 2 && n != 3 && n != 5)
+            n = 3;
+        h.stopCount = static_cast<uint8_t>(n);
+        if (h.gradFill == 0)
+        {
+            // hue/sat/light stay as the user base color.
+            FillAutoStops(h.hue, h.sat, h.light, n, h.stops);
+        }
+        else
+        {
+            const int mid = n / 2;
+            h.hue = h.stops[mid][0];
+            h.sat = h.stops[mid][1];
+            h.light = h.stops[mid][2];
+        }
+    }
+
+    void SampleGradientStops(float lum, int n, const float stops[kMaxGradStops][3],
+        float& r, float& g, float& b)
+    {
+        if (n <= 1)
+        {
+            r = Clamp01(stops[0][0]);
+            g = Clamp01(stops[0][1]);
+            b = Clamp01(stops[0][2]);
+            return;
+        }
+        lum = Clamp01(lum);
+        const float x = lum * static_cast<float>(n - 1);
+        int i0 = static_cast<int>(x);
+        if (i0 >= n - 1)
+        {
+            r = Clamp01(stops[n - 1][0]);
+            g = Clamp01(stops[n - 1][1]);
+            b = Clamp01(stops[n - 1][2]);
+            return;
+        }
+        const float f = x - static_cast<float>(i0);
+        r = Clamp01(stops[i0][0] + (stops[i0 + 1][0] - stops[i0][0]) * f);
+        g = Clamp01(stops[i0][1] + (stops[i0 + 1][1] - stops[i0][1]) * f);
+        b = Clamp01(stops[i0][2] + (stops[i0 + 1][2] - stops[i0][2]) * f);
+    }
+
+    void ApplySolidPixel(float& r, float& g, float& b, const SlotHsl& c)
+    {
+        const float lum = 0.299f * r + 0.587f * g + 0.114f * b;
+        if (c.mode == 2 && c.stopCount >= 2)
+        {
+            SampleGradientStops(lum, c.stopCount, c.stops, r, g, b);
+            return;
+        }
+        r = Clamp01(lum * c.hue);
+        g = Clamp01(lum * c.sat);
+        b = Clamp01(lum * c.light);
+    }
 
     void SyncSlotMirrorsFromLastRule(SlotHsl& h)
     {
@@ -101,18 +225,12 @@ namespace
         return SrcNear(r.sr, sr) && SrcNear(r.sg, sg) && SrcNear(r.sb, sb);
     }
 
-    float Clamp01(float v)
-    {
-        if (v < 0.f)
-            return 0.f;
-        if (v > 1.f)
-            return 1.f;
-        return v;
-    }
-
 
     std::mutex g_colorMutex;
     SlotHsl g_slotHsl[kMaxEquipSlots];
+    // Draft tints: paperdoll/DressUp only until Lua Apply commits to g_slotHsl.
+    SlotHsl g_draftHsl[kMaxEquipSlots];
+    std::atomic<bool> g_hslPreferDraft{ false };
 
     constexpr char kStateFile[] = "WarcraftXL_gear-recolor.state";
 
@@ -299,12 +417,9 @@ namespace
     {
         if (!c.active)
             return;
-        if (c.mode == 0)
+        if (c.mode == 0 || c.mode == 2)
         {
-            const float lum = 0.299f * r + 0.587f * g + 0.114f * b;
-            r = Clamp01(lum * c.hue);
-            g = Clamp01(lum * c.sat);
-            b = Clamp01(lum * c.light);
+            ApplySolidPixel(r, g, b, c);
             return;
         }
         // Selective: apply chained rules in order (each sees prior output), so a
@@ -342,9 +457,27 @@ namespace
             {
                 fprintf(f, "%d 0 %.6f %.6f %.6f\n", i, h.hue, h.sat, h.light);
             }
+            else if (h.mode == 2)
+            {
+                fprintf(f, "%d 2 %u %u", i,
+                    static_cast<unsigned>(h.stopCount),
+                    static_cast<unsigned>(h.gradFill));
+                if (h.gradFill == 0)
+                {
+                    // Auto: persist base color only (rebuild stops on load).
+                    fprintf(f, " %.6f %.6f %.6f", h.hue, h.sat, h.light);
+                }
+                else
+                {
+                    for (uint8_t s = 0; s < h.stopCount && s < kMaxGradStops; ++s)
+                        fprintf(f, " %.6f %.6f %.6f",
+                            h.stops[s][0], h.stops[s][1], h.stops[s][2]);
+                }
+                fprintf(f, "\n");
+            }
             else
             {
-                // New: slot 1 <count> then count×(sr sg sb dr dg db tol)
+                // Selective: slot 1 <count> then count×(sr sg sb dr dg db tol)
                 uint8_t nRules = h.ruleCount;
                 if (nRules == 0)
                 {
@@ -403,7 +536,57 @@ namespace
                 // Chained selective: "slot 1 <count:1..4> sr sg sb dr dg db tol ..."
                 // (old "slot 1 destR ..." yields count=0 via %d truncation → legacy path)
                 const int nHead = sscanf_s(line, "%d %d %d", &slot, &mode, &count);
-                if (nHead == 3 && mode == 1 && count >= 1 && count <= kMaxSelRules)
+                if (nHead == 3 && mode == 2 && (count == 2 || count == 3 || count == 5))
+                {
+                    // Solid gradient: slot 2 <nStops> <fill> then colors
+                    int fill = 0;
+                    const char* p = line;
+                    for (int tok = 0; tok < 2 && p && *p; ++tok)
+                    {
+                        while (*p == ' ' || *p == '\t')
+                            ++p;
+                        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
+                            ++p;
+                    }
+                    int nReadHead = 0;
+                    if (sscanf_s(p, " %d %d%n", &count, &fill, &nReadHead) < 2 || nReadHead <= 0)
+                        continue;
+                    p += nReadHead;
+                    h.mode = 2;
+                    h.stopCount = static_cast<uint8_t>(count);
+                    h.gradFill = (fill != 0) ? 1 : 0;
+                    if (h.gradFill == 0)
+                    {
+                        float br = 0.f, bg = 0.f, bb = 0.f;
+                        if (sscanf_s(p, " %f %f %f", &br, &bg, &bb) < 3)
+                            continue;
+                        h.hue = Clamp01(br);
+                        h.sat = Clamp01(bg);
+                        h.light = Clamp01(bb);
+                    }
+                    else
+                    {
+                        for (int s = 0; s < count; ++s)
+                        {
+                            float sr = 0.f, sg = 0.f, sb = 0.f;
+                            int nRead = 0;
+                            if (sscanf_s(p, " %f %f %f%n", &sr, &sg, &sb, &nRead) < 3
+                                || nRead <= 0)
+                            {
+                                h.active = false;
+                                break;
+                            }
+                            p += nRead;
+                            h.stops[s][0] = Clamp01(sr);
+                            h.stops[s][1] = Clamp01(sg);
+                            h.stops[s][2] = Clamp01(sb);
+                        }
+                        if (!h.active)
+                            continue;
+                    }
+                    ResolveSolidStops(h);
+                }
+                else if (nHead == 3 && mode == 1 && count >= 1 && count <= kMaxSelRules)
                 {
                     h.mode = 1;
                     h.ruleCount = 0;
@@ -606,10 +789,27 @@ namespace
         if (slot < 0 || slot >= kMaxEquipSlots)
             return false;
         std::lock_guard<std::mutex> lock(g_colorMutex);
+        // g_hslPreferDraft is set by preview OC draw / preview CharComponent paste.
+        if (g_hslPreferDraft.load(std::memory_order_relaxed) && g_draftHsl[slot].active)
+        {
+            out = g_draftHsl[slot];
+            return true;
+        }
         if (!g_slotHsl[slot].active)
             return false;
         out = g_slotHsl[slot];
         return true;
+    }
+
+    bool AnyDraftActive()
+    {
+        std::lock_guard<std::mutex> lock(g_colorMutex);
+        for (int i = 0; i < kMaxEquipSlots; ++i)
+        {
+            if (g_draftHsl[i].active)
+                return true;
+        }
+        return false;
     }
 
     bool TryHslForPath(const char* stem, SlotHsl& out, int* outSlot = nullptr)
@@ -649,6 +849,7 @@ namespace
     // Set for the duration of hkRenderPrep / forced rebuild — paste tint must
     // only run when this matches the local player model (never other PCs).
     std::atomic<void*> g_prepModel{ nullptr };
+    std::atomic<uint32_t> g_prepReasonCode{ 0 }; // 0 deny, 1 player, 2 sticky, 3 other-allow
     // Once we have matched unit->model == component.model, never use login optimism.
     std::atomic<bool> g_playerModelLocked{ false };
     // Retail: section loop at 0x4EE0D0 does `test [edi+0x0C], (1<<section)`.
@@ -846,20 +1047,27 @@ namespace
 
     bool IsPasteTintAllowed()
     {
-        if (!g_forceAllowPaste.load(std::memory_order_relaxed)
-            && !g_assemblingAllowed.load(std::memory_order_relaxed))
+        const bool force = g_forceAllowPaste.load(std::memory_order_relaxed);
+        const bool assembling = g_assemblingAllowed.load(std::memory_order_relaxed);
+        if (!force && !assembling)
             return false;
 
         // Hard world gate: even if sticky/optimism wrongly allowed another unit's
         // CharComponent, never mutate TextureCache for non-local assemblies.
         void* pm = LocalPlayerBodyModel();
-        if (pm)
-        {
-            void* prep = g_prepModel.load(std::memory_order_relaxed);
-            if (!prep || prep != pm)
-                return false;
-        }
-        return true;
+        void* prep = g_prepModel.load(std::memory_order_relaxed);
+        void* previewModel = g_previewModel.load(std::memory_order_relaxed);
+        if (!pm)
+            return true;
+        if (!prep)
+            return false;
+        if (prep == pm)
+            return true;
+        // DressUp / transmog preview rebuild while world player exists.
+        if (previewModel && prep == previewModel
+            && g_previewUiActive.load(std::memory_order_relaxed))
+            return true;
+        return false;
     }
 
     void ClearPlayerScope()
@@ -971,7 +1179,10 @@ namespace
             return;
         }
         g_forceAllowPaste.store(true, std::memory_order_relaxed);
-        g_prepModel.store(ComponentModel(component), std::memory_order_relaxed);
+        void* prepNow = ComponentModel(component);
+        g_prepModel.store(prepNow, std::memory_order_relaxed);
+        // Preview rebuilds must resolve draft HSL (paperdoll-only until Apply).
+        g_hslPreferDraft.store(isPreview, std::memory_order_relaxed);
         __try
         {
             g_origRenderPrep(component, 1);
@@ -985,6 +1196,7 @@ namespace
         g_forceAllowPaste.store(false, std::memory_order_relaxed);
         g_assemblingAllowed.store(false, std::memory_order_relaxed);
         g_prepModel.store(nullptr, std::memory_order_relaxed);
+        g_hslPreferDraft.store(false, std::memory_order_relaxed);
     }
 
     void ForceAllowedBodyRebuildForSlot(int slot)
@@ -1022,6 +1234,19 @@ namespace
             ForceComponentRebuild(preview, mask);
         else if (!preview && g_previewUiActive.load(std::memory_order_relaxed))
             g_pendingPreviewForce.store(true, std::memory_order_relaxed);
+    }
+
+    void ForcePreviewOnlyRebuildForSlot(int slot)
+    {
+        const uint32_t mask = SectionMaskForEquipSlot(slot);
+        if (mask == 0)
+            return;
+        void* preview = g_previewComponent.load(std::memory_order_relaxed);
+        if (preview)
+            ForceComponentRebuild(preview, mask);
+        else if (g_previewUiActive.load(std::memory_order_relaxed))
+            g_pendingPreviewForce.store(true, std::memory_order_relaxed);
+        ArmPreviewCapture(800);
     }
 
     // During pushAll / multi-rule SetSlotSelective, skip per-slot rebuilds — they
@@ -1136,6 +1361,7 @@ namespace
                 // Glue one-shot ONLY when we have no sticky yet. Never re-enter
                 // optimism for other CharComponents — that tinted every loading
                 // unit's TextureComponents (other PCs / shared cache corruption).
+                // Logs: localOk:2 reason:3 on full body pastes = this path.
                 allowed = true;
                 reason = "login_optimism";
                 g_localPlayerComponent.store(component, std::memory_order_relaxed);
@@ -1225,12 +1451,30 @@ namespace
 
 
         g_prepModel.store(model, std::memory_order_relaxed);
+        {
+            uint32_t code = 0;
+            if (allowed)
+            {
+                if (std::strcmp(reason, "player_model") == 0)
+                    code = 1;
+                else if (std::strcmp(reason, "sticky_component") == 0
+                    || std::strcmp(reason, "charselect_sticky") == 0
+                    || std::strcmp(reason, "charselect_retarget") == 0)
+                    code = 2;
+                else if (std::strcmp(reason, "login_optimism") == 0)
+                    code = 4;
+                else
+                    code = 3; // preview / other
+            }
+            g_prepReasonCode.store(code, std::memory_order_relaxed);
+        }
         g_assemblingAllowed.store(allowed, std::memory_order_relaxed);
         const int rc = g_origRenderPrep
             ? g_origRenderPrep(component, a2)
             : 0;
         g_assemblingAllowed.store(false, std::memory_order_relaxed);
         g_prepModel.store(nullptr, std::memory_order_relaxed);
+        g_prepReasonCode.store(0, std::memory_order_relaxed);
 
         // After world player locks: if natural paste already tinted (char-select
         // quality path), do NOT ForceComponentRebuild — that was the "adjustment"
@@ -1287,6 +1531,20 @@ namespace
     std::unordered_map<void*, TexTintCache> g_texTint;
     wxl::offsets::engine::gx::CharPasteToSectionFn g_origPasteToSection = nullptr;
     wxl::offsets::engine::gx::CharPasteToSectionFn g_origPasteFromSkin = nullptr;
+
+    // Durable Catch samples: captured while TextureCache/mip-table pixels are live.
+    // Stale void* handles after unload return GetPal=null — never rely on them at Catch time.
+    struct CatchSample
+    {
+        std::string path;
+        bool paletted = false;
+        uint32_t w = 0;
+        uint32_t h = 0;
+        std::vector<uint8_t> pixels; // 256*4 BGRX palette OR BGRA image
+        uint32_t tick = 0;
+    };
+    std::mutex g_catchMu;
+    CatchSample g_catchSample[kMaxEquipSlots];
 
     // Remember recent item pastes so HSL slider changes can re-tint composites live
     // (DressUpModel preview + world body) without equip/unequip.
@@ -1443,8 +1701,10 @@ namespace
     {
         std::lock_guard<std::mutex> lock(g_colorMutex);
         for (int i = 0; i < kMaxEquipSlots; ++i)
-            if (g_slotHsl[i].active)
+        {
+            if (g_slotHsl[i].active || g_draftHsl[i].active)
                 return true;
+        }
         return false;
     }
 
@@ -1502,6 +1762,397 @@ namespace
             wxl::offsets::engine::gx::kTextureCacheGetInfo);
         __try { return fn(tex, info, flag); }
         __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    }
+
+    void StoreCatchSample(int slot, CatchSample&& sample)
+    {
+        if (slot < 0 || slot >= kMaxEquipSlots || sample.pixels.empty())
+            return;
+        sample.tick = GetTickCount();
+        std::lock_guard<std::mutex> lock(g_catchMu);
+        g_catchSample[slot] = std::move(sample);
+    }
+
+    // Capture while TextureCache CPU data is still mapped (during CharComponent paste).
+    void CaptureCatchFromTextureCache(void* tex, int slot, const char* name)
+    {
+        if (!tex || slot < 0 || slot >= kMaxEquipSlots)
+            return;
+        uint8_t* pal = SafeGetPal(tex);
+        uint8_t info[8] = {};
+        uint32_t w = 0, h = 0;
+        if (SafeGetInfo(tex, info, 1))
+        {
+            w = *reinterpret_cast<uint16_t*>(info + 0);
+            h = *reinterpret_cast<uint16_t*>(info + 2);
+        }
+        uint8_t* mip0 = SafeGetMip(tex, 0);
+        CatchSample s{};
+        if (name)
+            s.path = name;
+        if (pal)
+        {
+            s.paletted = true;
+            s.w = w;
+            s.h = h;
+            s.pixels.assign(pal, pal + 256 * 4);
+            // Optional: keep usage-weighted idx by expanding a few samples into pixels later.
+            // Palette alone is enough for distant-color Catch.
+            (void)mip0;
+        }
+        else if (mip0 && w && h && w <= 2048 && h <= 2048)
+        {
+            s.paletted = false;
+            s.w = w;
+            s.h = h;
+            const size_t n = static_cast<size_t>(w) * h;
+            const size_t step = (n > 65536) ? (n / 65536) : 1;
+            s.pixels.reserve((n / step) * 4);
+            for (size_t i = 0; i < n; i += step)
+            {
+                const uint8_t* p = mip0 + i * 4;
+                s.pixels.push_back(p[0]);
+                s.pixels.push_back(p[1]);
+                s.pixels.push_back(p[2]);
+                s.pixels.push_back(p[3] ? p[3] : 255);
+            }
+            s.w = static_cast<uint32_t>(s.pixels.size() / 4);
+            s.h = 1;
+        }
+        else
+            return;
+        StoreCatchSample(slot, std::move(s));
+    }
+
+    // OC / TextureCreate path: pixels live in kMipTablePtr only during OnTextureUpload
+    // (emitted after native upload, before mip table clear).
+    void CaptureCatchFromMipTable(int slot, const char* name, uint32_t width, uint32_t height)
+    {
+        if (slot < 0 || slot >= kMaxEquipSlots || !width || !height)
+            return;
+        if (width > 2048 || height > 2048)
+            return;
+        namespace gxoff = wxl::offsets::engine::gx;
+        if (!*reinterpret_cast<uint32_t*>(gxoff::kMipTableValid))
+            return;
+        auto** tableHolder = reinterpret_cast<uint32_t**>(gxoff::kMipTablePtr);
+        if (!tableHolder || !*tableHolder)
+            return;
+        uint32_t* table = *tableHolder;
+        auto* pixels = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(table[0]));
+        if (!pixels)
+            return;
+        CatchSample s{};
+        if (name)
+            s.path = name;
+        s.paletted = false;
+        const size_t n = static_cast<size_t>(width) * height;
+        const size_t step = (n > 65536) ? (n / 65536) : 1;
+        s.pixels.reserve((n / step) * 4);
+        for (size_t i = 0; i < n; i += step)
+        {
+            const uint8_t* p = pixels + i * 4;
+            s.pixels.push_back(p[0]);
+            s.pixels.push_back(p[1]);
+            s.pixels.push_back(p[2]);
+            s.pixels.push_back(p[3] ? p[3] : 255);
+        }
+        s.w = static_cast<uint32_t>(s.pixels.size() / 4);
+        s.h = 1;
+        StoreCatchSample(slot, std::move(s));
+    }
+
+    // OC Catch: StretchRect cannot copy DXT albedos. Queue bound texture at
+    // phase 0; at EndScene blit via textured quad into an RT, then read back.
+    struct OcCatchPending
+    {
+        IDirect3DTexture9* tex = nullptr;
+        int slot = -1;
+        std::string path;
+    };
+    std::mutex g_ocCatchPendMu;
+    std::vector<OcCatchPending> g_ocCatchPend;
+
+    bool StoreCatchFromLockedRect(int slot, const char* path, const D3DLOCKED_RECT& lr,
+                                  UINT w, UINT h)
+    {
+        if (!lr.pBits || !w || !h || lr.Pitch <= 0 || slot < 0 || slot >= kMaxEquipSlots)
+            return false;
+        CatchSample s{};
+        if (path)
+            s.path = path;
+        s.paletted = false;
+        const size_t n = static_cast<size_t>(w) * h;
+        const size_t step = (n > 65536) ? (n / 65536) : 1;
+        s.pixels.reserve((n / step) * 4);
+        const auto* rows = static_cast<const uint8_t*>(lr.pBits);
+        for (size_t i = 0; i < n; i += step)
+        {
+            const size_t y = i / w;
+            const size_t x = i % w;
+            const uint8_t* p = rows + y * static_cast<size_t>(lr.Pitch) + x * 4u;
+            s.pixels.push_back(p[0]);
+            s.pixels.push_back(p[1]);
+            s.pixels.push_back(p[2]);
+            s.pixels.push_back(p[3] ? p[3] : 255);
+        }
+        s.w = static_cast<uint32_t>(s.pixels.size() / 4);
+        s.h = 1;
+        StoreCatchSample(slot, std::move(s));
+        return true;
+    }
+
+    bool ReadbackTextureToCatch(IDirect3DDevice9* dev, IDirect3DTexture9* tex,
+                                int slot, const char* path)
+    {
+        if (!dev || !tex || slot < 0 || slot >= kMaxEquipSlots)
+            return false;
+
+        D3DSURFACE_DESC desc{};
+        if (FAILED(tex->GetLevelDesc(0, &desc)) || !desc.Width || !desc.Height
+            || desc.Width > 2048 || desc.Height > 2048)
+            return false;
+
+
+        if (desc.Format == D3DFMT_A8R8G8B8 || desc.Format == D3DFMT_X8R8G8B8)
+        {
+            D3DLOCKED_RECT lr{};
+            if (SUCCEEDED(tex->LockRect(0, &lr, nullptr, D3DLOCK_READONLY)))
+            {
+                const bool ok = StoreCatchFromLockedRect(slot, path, lr, desc.Width, desc.Height);
+                tex->UnlockRect(0);
+                if (ok)
+                    return true;
+            }
+        }
+
+        // StretchRect cannot copy DXT→ARGB on this device (INVALIDCALL). Draw a
+        // textured screen-space quad into an RT, then GetRenderTargetData.
+        IDirect3DTexture9* rtTex = nullptr;
+        HRESULT hr = dev->CreateTexture(desc.Width, desc.Height, 1, D3DUSAGE_RENDERTARGET,
+            D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &rtTex, nullptr);
+        if (FAILED(hr) || !rtTex)
+        {
+            return false;
+        }
+        IDirect3DSurface9* rtSurf = nullptr;
+        if (FAILED(rtTex->GetSurfaceLevel(0, &rtSurf)) || !rtSurf)
+        {
+            rtTex->Release();
+            return false;
+        }
+
+        IDirect3DSurface9* oldRt = nullptr;
+        IDirect3DSurface9* oldDepth = nullptr;
+        dev->GetRenderTarget(0, &oldRt);
+        dev->GetDepthStencilSurface(&oldDepth);
+
+        IDirect3DStateBlock9* sb = nullptr;
+        if (SUCCEEDED(dev->CreateStateBlock(D3DSBT_ALL, &sb)) && sb)
+            sb->Capture();
+
+        bool blitOk = false;
+        if (SUCCEEDED(dev->SetRenderTarget(0, rtSurf)))
+        {
+            dev->SetDepthStencilSurface(nullptr);
+            const D3DVIEWPORT9 vp{ 0, 0, desc.Width, desc.Height, 0.f, 1.f };
+            dev->SetViewport(&vp);
+            dev->Clear(0, nullptr, D3DCLEAR_TARGET, 0, 1.f, 0);
+
+            dev->SetPixelShader(nullptr);
+            dev->SetVertexShader(nullptr);
+            dev->SetRenderState(D3DRS_ZENABLE, FALSE);
+            dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+            dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+            dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+            dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+            dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+            dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+            dev->SetRenderState(D3DRS_COLORWRITEENABLE,
+                D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN
+                | D3DCOLORWRITEENABLE_BLUE | D3DCOLORWRITEENABLE_ALPHA);
+            dev->SetTexture(0, tex);
+            dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+            dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+            dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+            dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+            dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+            dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+            dev->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+            dev->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+
+            struct BlitVtx { float x, y, z, rhw, u, v; };
+            const float r = static_cast<float>(desc.Width) - 0.5f;
+            const float b = static_cast<float>(desc.Height) - 0.5f;
+            const BlitVtx quad[4] = {
+                { -0.5f, -0.5f, 0.f, 1.f, 0.f, 0.f },
+                { r,     -0.5f, 0.f, 1.f, 1.f, 0.f },
+                { -0.5f, b,     0.f, 1.f, 0.f, 1.f },
+                { r,     b,     0.f, 1.f, 1.f, 1.f },
+            };
+            dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+            hr = dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(BlitVtx));
+            blitOk = SUCCEEDED(hr);
+        }
+
+        if (sb)
+        {
+            sb->Apply();
+            sb->Release();
+        }
+        if (oldRt)
+        {
+            dev->SetRenderTarget(0, oldRt);
+            oldRt->Release();
+        }
+        if (oldDepth)
+        {
+            dev->SetDepthStencilSurface(oldDepth);
+            oldDepth->Release();
+        }
+
+        if (!blitOk)
+        {
+            rtSurf->Release();
+            rtTex->Release();
+            return false;
+        }
+
+        IDirect3DSurface9* staging = nullptr;
+        hr = dev->CreateOffscreenPlainSurface(desc.Width, desc.Height, D3DFMT_A8R8G8B8,
+            D3DPOOL_SYSTEMMEM, &staging, nullptr);
+        if (FAILED(hr) || !staging)
+        {
+            rtSurf->Release();
+            rtTex->Release();
+            return false;
+        }
+        hr = dev->GetRenderTargetData(rtSurf, staging);
+        rtSurf->Release();
+        rtTex->Release();
+        if (FAILED(hr))
+        {
+            staging->Release();
+            return false;
+        }
+
+        D3DLOCKED_RECT lr{};
+        if (FAILED(staging->LockRect(&lr, nullptr, D3DLOCK_READONLY)))
+        {
+            staging->Release();
+            return false;
+        }
+        const bool ok = StoreCatchFromLockedRect(slot, path, lr, desc.Width, desc.Height);
+        staging->UnlockRect();
+        staging->Release();
+        return ok;
+    }
+
+    void FlushOcCatchPending(IDirect3DDevice9* dev)
+    {
+        if (!dev)
+            return;
+        std::vector<OcCatchPending> local;
+        {
+            std::lock_guard<std::mutex> lock(g_ocCatchPendMu);
+            local.swap(g_ocCatchPend);
+        }
+        for (OcCatchPending& p : local)
+        {
+            if (p.tex)
+            {
+                ReadbackTextureToCatch(dev, p.tex, p.slot, p.path.empty() ? nullptr : p.path.c_str());
+                p.tex->Release();
+                p.tex = nullptr;
+            }
+        }
+    }
+
+    void QueueOcCatchFromDevice(IDirect3DDevice9* dev, int slot, const char* path)
+    {
+        if (!dev || slot < 0 || slot >= kMaxEquipSlots)
+            return;
+        {
+            std::lock_guard<std::mutex> lock(g_catchMu);
+            const CatchSample& cur = g_catchSample[slot];
+            if (!cur.pixels.empty() && path && !cur.path.empty() && cur.path == path)
+                return;
+        }
+
+        IDirect3DBaseTexture9* base = nullptr;
+        if (FAILED(dev->GetTexture(0, &base)) || !base)
+            return;
+
+        IDirect3DTexture9* tex = nullptr;
+        if (FAILED(base->QueryInterface(__uuidof(IDirect3DTexture9),
+                reinterpret_cast<void**>(&tex))) || !tex)
+        {
+            base->Release();
+            return;
+        }
+        base->Release();
+
+        D3DSURFACE_DESC desc{};
+        if (FAILED(tex->GetLevelDesc(0, &desc)) || !desc.Width || !desc.Height
+            || desc.Width > 2048 || desc.Height > 2048)
+        {
+            tex->Release();
+            return;
+        }
+
+        // Try immediate lock (MANAGED); else defer to EndScene.
+        if (desc.Format == D3DFMT_A8R8G8B8 || desc.Format == D3DFMT_X8R8G8B8)
+        {
+            D3DLOCKED_RECT lr{};
+            if (SUCCEEDED(tex->LockRect(0, &lr, nullptr, D3DLOCK_READONLY)))
+            {
+                const bool ok = StoreCatchFromLockedRect(slot, path, lr, desc.Width, desc.Height);
+                tex->UnlockRect(0);
+                if (ok)
+                {
+                    tex->Release();
+                    return;
+                }
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_ocCatchPendMu);
+            for (OcCatchPending& p : g_ocCatchPend)
+            {
+                if (p.slot == slot)
+                {
+                    if (p.tex)
+                        p.tex->Release();
+                    p.tex = tex;
+                    p.path = path ? path : "";
+                    return;
+                }
+            }
+            if (g_ocCatchPend.size() >= 12)
+            {
+                OcCatchPending old = std::move(g_ocCatchPend.front());
+                g_ocCatchPend.erase(g_ocCatchPend.begin());
+                if (old.tex)
+                    old.tex->Release();
+            }
+            OcCatchPending neu{};
+            neu.tex = tex;
+            neu.slot = slot;
+            neu.path = path ? path : "";
+            g_ocCatchPend.push_back(std::move(neu));
+        }
+    }
+
+    void* LoadTextureCacheByPath(const char* path) noexcept
+    {
+        if (!path || !path[0])
+            return nullptr;
+        auto fn = reinterpret_cast<wxl::offsets::engine::gx::TextureCacheCreateFn>(
+            wxl::offsets::engine::gx::kTextureCacheCreate);
+        __try { return fn(path); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
     }
 
     void HslBgraBuffer(uint8_t* pixels, size_t count, const SlotHsl& hsl, bool skipLowAlpha,
@@ -1958,11 +2609,21 @@ namespace
                 if (slot < 0)
                     slot = SlotForComponentTexture(name);
                 if (allow && slot >= 0)
+                {
                     RememberLivePaste(section, srcTexture, dstMips, slot);
+                    // Catch bank must match /recolor: only local-player pastes.
+                    // DressUp / transmog preview rebuilds must NOT overwrite the sample
+                    // (last-write would make Tints Catch ≠ /recolor Catch for the same slot).
+                    void* prep = g_prepModel.load(std::memory_order_relaxed);
+                    void* pm = LocalPlayerBodyModel();
+                    const bool playerCatch = (pm && prep == pm)
+                        || (!pm); // char-select / no world player: keep prior behavior
+                    if (playerCatch)
+                        CaptureCatchFromTextureCache(srcTexture, slot, name);
+                }
                 if (allow && hasHsl)
                 {
-                    const char* mode = "none";
-                    const bool ok = TintTextureCacheForPaste(srcTexture, name, hsl, slot, &mode);
+                    const bool ok = TintTextureCacheForPaste(srcTexture, name, hsl, slot, nullptr);
                     didTint = ok;
                     tintName = name;
                     if (ok && !g_forceAllowPaste.load(std::memory_order_relaxed))
@@ -2012,9 +2673,218 @@ namespace
         SlotHsl h{};
         h.active = true;
         h.mode = 0;
+        h.stopCount = 1;
+        h.gradFill = 0;
         h.hue = Clamp01(r);
         h.sat = Clamp01(g);
         h.light = Clamp01(b);
+        h.stops[0][0] = h.hue;
+        h.stops[0][1] = h.sat;
+        h.stops[0][2] = h.light;
+        {
+            std::lock_guard<std::mutex> lock(g_colorMutex);
+            g_slotHsl[slot] = h;
+        }
+        NotifyOcSlotChanged(slot);
+        if (g_previewUiActive.load(std::memory_order_relaxed))
+            ArmPreviewCapture(800);
+        if (IsBodyEquipSlot(slot))
+            RequestBodyRebuildForSlot(slot);
+        SaveHslToDisk();
+    }
+
+    void SetSlotDraftSolid(int slot, float r, float g, float b)
+    {
+        if (slot < 0 || slot >= kMaxEquipSlots)
+            return;
+        SlotHsl h{};
+        h.active = true;
+        h.mode = 0;
+        h.stopCount = 1;
+        h.gradFill = 0;
+        h.hue = Clamp01(r);
+        h.sat = Clamp01(g);
+        h.light = Clamp01(b);
+        h.stops[0][0] = h.hue;
+        h.stops[0][1] = h.sat;
+        h.stops[0][2] = h.light;
+        {
+            std::lock_guard<std::mutex> lock(g_colorMutex);
+            g_draftHsl[slot] = h;
+        }
+        NotifyOcSlotChanged(slot);
+        if (g_previewUiActive.load(std::memory_order_relaxed))
+            ArmPreviewCapture(800);
+        if (IsBodyEquipSlot(slot))
+            ForcePreviewOnlyRebuildForSlot(slot);
+    }
+
+    void SetSlotDraftGradient(int slot, int nStops, int fill, const float* colors, int colorFloats)
+    {
+        if (slot < 0 || slot >= kMaxEquipSlots || !colors)
+            return;
+        if (nStops != 2 && nStops != 3 && nStops != 5)
+            nStops = 3;
+        SlotHsl h{};
+        h.active = true;
+        h.mode = 2;
+        h.stopCount = static_cast<uint8_t>(nStops);
+        h.gradFill = (fill != 0) ? 1 : 0;
+        if (h.gradFill == 0)
+        {
+            if (colorFloats < 3)
+                return;
+            h.hue = Clamp01(colors[0]);
+            h.sat = Clamp01(colors[1]);
+            h.light = Clamp01(colors[2]);
+        }
+        else
+        {
+            if (colorFloats < nStops * 3)
+                return;
+            for (int s = 0; s < nStops; ++s)
+            {
+                h.stops[s][0] = Clamp01(colors[s * 3 + 0]);
+                h.stops[s][1] = Clamp01(colors[s * 3 + 1]);
+                h.stops[s][2] = Clamp01(colors[s * 3 + 2]);
+            }
+        }
+        ResolveSolidStops(h);
+        {
+            std::lock_guard<std::mutex> lock(g_colorMutex);
+            g_draftHsl[slot] = h;
+        }
+        NotifyOcSlotChanged(slot);
+        if (g_previewUiActive.load(std::memory_order_relaxed))
+            ArmPreviewCapture(800);
+        if (IsBodyEquipSlot(slot))
+            ForcePreviewOnlyRebuildForSlot(slot);
+    }
+
+    // Selective draft: paperdoll/DressUp only until ApplyDraft commits to g_slotHsl.
+    void SetSlotDraftSelective(int slot, const SelRule* rules, int ruleCount)
+    {
+        if (slot < 0 || slot >= kMaxEquipSlots)
+            return;
+        if (!rules || ruleCount <= 0)
+        {
+            {
+                std::lock_guard<std::mutex> lock(g_colorMutex);
+                g_draftHsl[slot] = {};
+            }
+            NotifyOcSlotChanged(slot);
+            if (g_previewUiActive.load(std::memory_order_relaxed))
+                ArmPreviewCapture(800);
+            if (IsBodyEquipSlot(slot))
+                ForcePreviewOnlyRebuildForSlot(slot);
+            return;
+        }
+        SlotHsl h{};
+        h.active = true;
+        h.mode = 1;
+        const int n = (std::min)(ruleCount, kMaxSelRules);
+        h.ruleCount = static_cast<uint8_t>(n);
+        for (int i = 0; i < n; ++i)
+        {
+            SelRule r = rules[i];
+            r.sr = Clamp01(r.sr);
+            r.sg = Clamp01(r.sg);
+            r.sb = Clamp01(r.sb);
+            r.dr = Clamp01(r.dr);
+            r.dg = Clamp01(r.dg);
+            r.db = Clamp01(r.db);
+            r.tol = Clamp01(r.tol);
+            if (r.tol < 0.02f)
+                r.tol = 0.35f;
+            h.rules[i] = r;
+        }
+        SyncSlotMirrorsFromLastRule(h);
+        {
+            std::lock_guard<std::mutex> lock(g_colorMutex);
+            g_draftHsl[slot] = h;
+        }
+        NotifyOcSlotChanged(slot);
+        if (g_previewUiActive.load(std::memory_order_relaxed))
+            ArmPreviewCapture(800);
+        if (IsBodyEquipSlot(slot))
+            ForcePreviewOnlyRebuildForSlot(slot);
+    }
+
+    void ApplySlotDraft(int slot)
+    {
+        if (slot < 0 || slot >= kMaxEquipSlots)
+            return;
+        SlotHsl h{};
+        {
+            std::lock_guard<std::mutex> lock(g_colorMutex);
+            if (!g_draftHsl[slot].active)
+                return;
+            h = g_draftHsl[slot];
+            g_slotHsl[slot] = h;
+            g_draftHsl[slot] = {};
+        }
+        NotifyOcSlotChanged(slot);
+        if (g_previewUiActive.load(std::memory_order_relaxed))
+            ArmPreviewCapture(800);
+        if (IsBodyEquipSlot(slot))
+            RequestBodyRebuildForSlot(slot);
+        else
+            ForcePreviewOnlyRebuildForSlot(slot);
+        SaveHslToDisk();
+    }
+
+    void ResetSlotTint(int slot)
+    {
+        if (slot < 0 || slot >= kMaxEquipSlots)
+            return;
+        {
+            std::lock_guard<std::mutex> lock(g_colorMutex);
+            g_slotHsl[slot] = {};
+            g_draftHsl[slot] = {};
+        }
+        NotifyOcSlotChanged(slot);
+        if (g_previewUiActive.load(std::memory_order_relaxed))
+            ArmPreviewCapture(800);
+        if (IsBodyEquipSlot(slot))
+            RequestBodyRebuildForSlot(slot);
+        else
+            ForcePreviewOnlyRebuildForSlot(slot);
+        SaveHslToDisk();
+    }
+
+    // nStops: 2, 3, or 5. fill: 0=auto from colors[0], 1=custom colors[0..nStops).
+    // colors layout: RGB triples packed flat (max 5*3).
+    void SetSlotGradient(int slot, int nStops, int fill, const float* colors, int colorFloats)
+    {
+        if (slot < 0 || slot >= kMaxEquipSlots || !colors)
+            return;
+        if (nStops != 2 && nStops != 3 && nStops != 5)
+            nStops = 3;
+        SlotHsl h{};
+        h.active = true;
+        h.mode = 2;
+        h.stopCount = static_cast<uint8_t>(nStops);
+        h.gradFill = (fill != 0) ? 1 : 0;
+        if (h.gradFill == 0)
+        {
+            if (colorFloats < 3)
+                return;
+            h.hue = Clamp01(colors[0]);
+            h.sat = Clamp01(colors[1]);
+            h.light = Clamp01(colors[2]);
+        }
+        else
+        {
+            if (colorFloats < nStops * 3)
+                return;
+            for (int s = 0; s < nStops; ++s)
+            {
+                h.stops[s][0] = Clamp01(colors[s * 3 + 0]);
+                h.stops[s][1] = Clamp01(colors[s * 3 + 1]);
+                h.stops[s][2] = Clamp01(colors[s * 3 + 2]);
+            }
+        }
+        ResolveSolidStops(h);
         {
             std::lock_guard<std::mutex> lock(g_colorMutex);
             g_slotHsl[slot] = h;
@@ -2119,8 +2989,7 @@ namespace
         SaveHslToDisk();
     }
 
-    // Solid OC PS — keep byte-stable with the proven lighting path (do not share
-    // a branched shader with selective; that changed Solid results).
+    // Solid OC PS — single color (byte-stable lighting path).
     constexpr char kSolidPsHlsl[] = R"(
 sampler2D s0 : register(s0);
 float4 c0 : register(c0);
@@ -2130,6 +2999,41 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
     float4 t = tex2D(s0, uv);
     float lum = dot(t.rgb, float3(0.299, 0.587, 0.114));
     float3 colored = saturate(lum * c0.rgb);
+    float3 outRgb = saturate(colored * diff.rgb);
+    return float4(outRgb, saturate(t.a * diff.a));
+}
+)";
+
+    // Solid gradient OC PS: luminance samples up to 5 stop colors (c1..c5), count in c0.a.
+    constexpr char kSolidGradPsHlsl[] = R"(
+sampler2D s0 : register(s0);
+float4 c0 : register(c0);
+float4 c1 : register(c1);
+float4 c2 : register(c2);
+float4 c3 : register(c3);
+float4 c4 : register(c4);
+float4 c5 : register(c5);
+
+float3 stopAt(float idx)
+{
+    if (idx < 0.5) return c1.rgb;
+    if (idx < 1.5) return c2.rgb;
+    if (idx < 2.5) return c3.rgb;
+    if (idx < 3.5) return c4.rgb;
+    return c5.rgb;
+}
+
+float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
+{
+    float4 t = tex2D(s0, uv);
+    float lum = saturate(dot(t.rgb, float3(0.299, 0.587, 0.114)));
+    float n = max(2.0, min(5.0, c0.a));
+    float x = lum * (n - 1.0);
+    float i0 = floor(x);
+    float f = saturate(x - i0);
+    float3 a = stopAt(i0);
+    float3 b = stopAt(min(i0 + 1.0, n - 1.0));
+    float3 colored = saturate(lerp(a, b, f));
     float3 outRgb = saturate(colored * diff.rgb);
     return float4(outRgb, saturate(t.a * diff.a));
 }
@@ -2205,6 +3109,28 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
             WLOG_INFO("gear-recolor: solid OC PS v%d ready", kPsVer);
         else
             WLOG_WARN("gear-recolor: solid OC PS compile failed");
+        return ps;
+    }
+
+    IDirect3DPixelShader9* EnsureSolidGradPs(void* deviceRaw)
+    {
+        static IDirect3DPixelShader9* ps = nullptr;
+        static int compiledVer = 0;
+        constexpr int kPsVer = 1;
+        if (compiledVer == kPsVer)
+            return ps;
+        compiledVer = kPsVer;
+        if (ps)
+        {
+            ps->Release();
+            ps = nullptr;
+        }
+        ps = static_cast<IDirect3DPixelShader9*>(
+            gx::CompilePixelShader(gx::Device9(deviceRaw), kSolidGradPsHlsl, "ps_2_0"));
+        if (ps)
+            WLOG_INFO("gear-recolor: solid gradient OC PS v%d ready", kPsVer);
+        else
+            WLOG_WARN("gear-recolor: solid gradient OC PS compile failed");
         return ps;
     }
 
@@ -2570,6 +3496,255 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
         return ok;
     }
 
+    // Quantize + farthest-point: 3 distant colors from the worn item's texture.
+    // Prefer durable CatchSample (captured at paste/upload). Stale TextureCache
+    // handles return GetPal=null after unload — never rely on them alone.
+    bool CatchDistantColors(int slot, float outRgb[9], int* outCount)
+    {
+        if (outCount)
+            *outCount = 0;
+        if (slot < 0 || slot >= kMaxEquipSlots || !outRgb)
+            return false;
+
+        struct Bucket
+        {
+            double r = 0, g = 0, b = 0;
+            int n = 0;
+        };
+        std::unordered_map<uint32_t, Bucket> buckets;
+        buckets.reserve(512);
+
+        auto addPixel = [&](float r, float g, float b, float a) {
+            if (a < 0.08f)
+                return;
+            const float mx = (std::max)(r, (std::max)(g, b));
+            const float mn = (std::min)(r, (std::min)(g, b));
+            if (mx < 0.06f)
+                return;
+            if (mx > 0.97f && (mx - mn) < 0.06f)
+                return;
+            const float sat = (mx > 1e-6f) ? ((mx - mn) / mx) : 0.f;
+            if (sat < 0.06f)
+                return;
+            const int qr = (std::min)(31, static_cast<int>(Clamp01(r) * 31.f + 0.5f));
+            const int qg = (std::min)(31, static_cast<int>(Clamp01(g) * 31.f + 0.5f));
+            const int qb = (std::min)(31, static_cast<int>(Clamp01(b) * 31.f + 0.5f));
+            const uint32_t key = (static_cast<uint32_t>(qr) << 10)
+                | (static_cast<uint32_t>(qg) << 5)
+                | static_cast<uint32_t>(qb);
+            Bucket& bk = buckets[key];
+            bk.r += r;
+            bk.g += g;
+            bk.b += b;
+            ++bk.n;
+        };
+
+        auto ingestSample = [&](const CatchSample& s) {
+            if (s.pixels.empty())
+                return;
+            if (s.paletted && s.pixels.size() >= 256 * 4)
+            {
+                for (int i = 0; i < 256; ++i)
+                {
+                    const uint8_t* p = s.pixels.data() + static_cast<size_t>(i) * 4u;
+                    if (p[0] < 4 && p[1] < 4 && p[2] < 4)
+                        continue;
+                    addPixel(p[2] / 255.f, p[1] / 255.f, p[0] / 255.f, 1.f);
+                }
+            }
+            else
+            {
+                const size_t n = s.pixels.size() / 4;
+                for (size_t i = 0; i < n; ++i)
+                {
+                    const uint8_t* p = s.pixels.data() + i * 4;
+                    const float a = (p[3] > 0) ? (p[3] / 255.f) : 1.f;
+                    addPixel(p[2] / 255.f, p[1] / 255.f, p[0] / 255.f, a);
+                }
+            }
+        };
+
+        int bankOk = 0;
+        int reloadOk = 0;
+        std::string bankPath;
+        {
+            std::lock_guard<std::mutex> lock(g_catchMu);
+            const CatchSample& s = g_catchSample[slot];
+            if (!s.pixels.empty())
+            {
+                bankOk = 1;
+                bankPath = s.path;
+                ingestSample(s);
+            }
+        }
+
+        // Reload TextureComponents BLP by path if bank empty (body slots).
+        if (buckets.empty())
+        {
+            std::vector<std::string> paths;
+            {
+                std::lock_guard<std::mutex> lock(g_texMutex);
+                for (auto& kv : g_texNames)
+                {
+                    const char* p = kv.second.c_str();
+                    if (!IsItemComponentTexture(p))
+                        continue;
+                    const int mapped = SlotForComponentTexture(p);
+                    if (!SlotMatchesLivePaste(slot, mapped))
+                        continue;
+                    paths.push_back(kv.second);
+                }
+            }
+            if (paths.empty() && !bankPath.empty())
+                paths.push_back(bankPath);
+            for (const std::string& path : paths)
+            {
+                void* tex = LoadTextureCacheByPath(path.c_str());
+                if (!tex)
+                    continue;
+                CaptureCatchFromTextureCache(tex, slot, path.c_str());
+                std::lock_guard<std::mutex> lock(g_catchMu);
+                if (!g_catchSample[slot].pixels.empty())
+                {
+                    reloadOk = 1;
+                    ingestSample(g_catchSample[slot]);
+                    break;
+                }
+            }
+        }
+
+        // Still empty: try loose palette ingest from bank/reload without sat gate.
+        if (buckets.empty())
+        {
+            CatchSample s{};
+            {
+                std::lock_guard<std::mutex> lock(g_catchMu);
+                s = g_catchSample[slot];
+            }
+            if (s.paletted && s.pixels.size() >= 256 * 4)
+            {
+                for (int i = 0; i < 256; ++i)
+                {
+                    const uint8_t* p = s.pixels.data() + static_cast<size_t>(i) * 4u;
+                    if (p[0] < 3 && p[1] < 3 && p[2] < 3)
+                        continue;
+                    const float r = p[2] / 255.f, g = p[1] / 255.f, b = p[0] / 255.f;
+                    const float mx = (std::max)(r, (std::max)(g, b));
+                    if (mx < 0.04f)
+                        continue;
+                    const int qr = (std::min)(31, static_cast<int>(r * 31.f + 0.5f));
+                    const int qg = (std::min)(31, static_cast<int>(g * 31.f + 0.5f));
+                    const int qb = (std::min)(31, static_cast<int>(b * 31.f + 0.5f));
+                    const uint32_t key = (static_cast<uint32_t>(qr) << 10)
+                        | (static_cast<uint32_t>(qg) << 5)
+                        | static_cast<uint32_t>(qb);
+                    Bucket& bk = buckets[key];
+                    bk.r += r; bk.g += g; bk.b += b; ++bk.n;
+                }
+            }
+        }
+
+        struct Cand
+        {
+            float r, g, b;
+            int n;
+            float sat;
+        };
+        std::vector<Cand> cands;
+        cands.reserve(buckets.size());
+        for (auto& kv : buckets)
+        {
+            if (kv.second.n <= 0)
+                continue;
+            const float inv = 1.f / static_cast<float>(kv.second.n);
+            Cand c{};
+            c.r = Clamp01(static_cast<float>(kv.second.r * inv));
+            c.g = Clamp01(static_cast<float>(kv.second.g * inv));
+            c.b = Clamp01(static_cast<float>(kv.second.b * inv));
+            c.n = kv.second.n;
+            const float mx = (std::max)(c.r, (std::max)(c.g, c.b));
+            const float mn = (std::min)(c.r, (std::min)(c.g, c.b));
+            c.sat = (mx > 1e-6f) ? ((mx - mn) / mx) : 0.f;
+            cands.push_back(c);
+        }
+        if (cands.empty())
+        {
+            return false;
+        }
+
+        std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
+            const float sa = a.sat * std::sqrt(static_cast<float>(a.n));
+            const float sb = b.sat * std::sqrt(static_cast<float>(b.n));
+            return sa > sb;
+        });
+        if (cands.size() > 96)
+            cands.resize(96);
+
+        auto dist2 = [](const Cand& a, const Cand& b) {
+            const float dr = a.r - b.r, dg = a.g - b.g, db = a.b - b.b;
+            return dr * dr + dg * dg + db * db;
+        };
+
+        int picked[3] = { -1, -1, -1 };
+        int nPick = 0;
+        picked[0] = 0;
+        nPick = 1;
+        while (nPick < 3 && nPick < static_cast<int>(cands.size()))
+        {
+            int best = -1;
+            float bestMin = -1.f;
+            for (int i = 0; i < static_cast<int>(cands.size()); ++i)
+            {
+                bool used = false;
+                for (int p = 0; p < nPick; ++p)
+                    if (picked[p] == i)
+                        used = true;
+                if (used)
+                    continue;
+                float mind = 1e9f;
+                for (int p = 0; p < nPick; ++p)
+                    mind = (std::min)(mind, dist2(cands[i], cands[picked[p]]));
+                if (mind > bestMin)
+                {
+                    bestMin = mind;
+                    best = i;
+                }
+            }
+            if (best < 0 || bestMin < 0.0025f)
+                break;
+            picked[nPick++] = best;
+        }
+
+        for (int i = 0; i < nPick; ++i)
+        {
+            outRgb[i * 3 + 0] = cands[picked[i]].r;
+            outRgb[i * 3 + 1] = cands[picked[i]].g;
+            outRgb[i * 3 + 2] = cands[picked[i]].b;
+        }
+        if (outCount)
+            *outCount = nPick;
+
+        return nPick > 0;
+    }
+
+    int __cdecl LuaRecolorCatchSlotColors(void* state)
+    {
+        if (!state || wlua::GetTop(state) < 1)
+            return 0;
+        const int slot = static_cast<int>(wlua::ToNumber(state, 1));
+        float rgb[9] = {};
+        int n = 0;
+        if (!CatchDistantColors(slot, rgb, &n) || n <= 0)
+        {
+            wlua::PushNumber(state, 0.0);
+            return 1;
+        }
+        wlua::PushNumber(state, static_cast<double>(n));
+        for (int i = 0; i < n * 3; ++i)
+            wlua::PushNumber(state, static_cast<double>(rgb[i]));
+        return 1 + n * 3;
+    }
+
     int __cdecl LuaRecolorSetSlot(void* state)
     {
         if (!state || wlua::GetTop(state) < 4)
@@ -2581,6 +3756,141 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
         SetSlotHsl(slot, r, g, b);
         wlua::PushBoolean(state, 1);
         return 1;
+    }
+
+    int __cdecl LuaRecolorSetSlotDraft(void* state)
+    {
+        if (!state || wlua::GetTop(state) < 4)
+            return 0;
+        const int slot = static_cast<int>(wlua::ToNumber(state, 1));
+        const float r = static_cast<float>(wlua::ToNumber(state, 2));
+        const float g = static_cast<float>(wlua::ToNumber(state, 3));
+        const float b = static_cast<float>(wlua::ToNumber(state, 4));
+        SetSlotDraftSolid(slot, r, g, b);
+        wlua::PushBoolean(state, 1);
+        return 1;
+    }
+
+    int __cdecl LuaRecolorSetSlotGradientDraft(void* state)
+    {
+        if (!state || wlua::GetTop(state) < 5)
+            return 0;
+        const int slot = static_cast<int>(wlua::ToNumber(state, 1));
+        const int nStops = static_cast<int>(wlua::ToNumber(state, 2));
+        const int fill = static_cast<int>(wlua::ToNumber(state, 3));
+        const int top = wlua::GetTop(state);
+        float colors[kMaxGradStops * 3] = {};
+        int nFloats = 0;
+        for (int i = 4; i <= top && nFloats < kMaxGradStops * 3; ++i)
+            colors[nFloats++] = static_cast<float>(wlua::ToNumber(state, i));
+        SetSlotDraftGradient(slot, nStops, fill, colors, nFloats);
+        wlua::PushBoolean(state, 1);
+        return 1;
+    }
+
+    // WXL_RecolorSetSlotSelectiveDraft(slot, nRules [, sr,sg,sb, dr,dg,db, tol]...)
+    // nRules=0 clears the selective draft for preview.
+    int __cdecl LuaRecolorSetSlotSelectiveDraft(void* state)
+    {
+        if (!state || wlua::GetTop(state) < 2)
+            return 0;
+        const int slot = static_cast<int>(wlua::ToNumber(state, 1));
+        const int nRules = static_cast<int>(wlua::ToNumber(state, 2));
+        if (nRules <= 0)
+        {
+            SetSlotDraftSelective(slot, nullptr, 0);
+            wlua::PushBoolean(state, 1);
+            return 1;
+        }
+        SelRule rules[kMaxSelRules] = {};
+        const int top = wlua::GetTop(state);
+        int arg = 3;
+        int count = 0;
+        for (int i = 0; i < nRules && i < kMaxSelRules; ++i)
+        {
+            if (arg + 6 > top)
+                break;
+            rules[count].sr = static_cast<float>(wlua::ToNumber(state, arg++));
+            rules[count].sg = static_cast<float>(wlua::ToNumber(state, arg++));
+            rules[count].sb = static_cast<float>(wlua::ToNumber(state, arg++));
+            rules[count].dr = static_cast<float>(wlua::ToNumber(state, arg++));
+            rules[count].dg = static_cast<float>(wlua::ToNumber(state, arg++));
+            rules[count].db = static_cast<float>(wlua::ToNumber(state, arg++));
+            rules[count].tol = static_cast<float>(wlua::ToNumber(state, arg++));
+            ++count;
+        }
+        SetSlotDraftSelective(slot, rules, count);
+        wlua::PushBoolean(state, 1);
+        return 1;
+    }
+
+    int __cdecl LuaRecolorApplyDraft(void* state)
+    {
+        if (!state || wlua::GetTop(state) < 1)
+            return 0;
+        ApplySlotDraft(static_cast<int>(wlua::ToNumber(state, 1)));
+        wlua::PushBoolean(state, 1);
+        return 1;
+    }
+
+    int __cdecl LuaRecolorResetTint(void* state)
+    {
+        if (!state || wlua::GetTop(state) < 1)
+            return 0;
+        ResetSlotTint(static_cast<int>(wlua::ToNumber(state, 1)));
+        wlua::PushBoolean(state, 1);
+        return 1;
+    }
+
+    int __cdecl LuaRecolorSetSlotGradient(void* state)
+    {
+        if (!state || wlua::GetTop(state) < 5)
+            return 0;
+        const int slot = static_cast<int>(wlua::ToNumber(state, 1));
+        const int nStops = static_cast<int>(wlua::ToNumber(state, 2));
+        const int fill = static_cast<int>(wlua::ToNumber(state, 3));
+        const int top = wlua::GetTop(state);
+        float colors[kMaxGradStops * 3] = {};
+        int nFloats = 0;
+        for (int i = 4; i <= top && nFloats < kMaxGradStops * 3; ++i)
+            colors[nFloats++] = static_cast<float>(wlua::ToNumber(state, i));
+        SetSlotGradient(slot, nStops, fill, colors, nFloats);
+        wlua::PushBoolean(state, 1);
+        return 1;
+    }
+
+    int __cdecl LuaRecolorGetSlotGradient(void* state)
+    {
+        if (!state || wlua::GetTop(state) < 1)
+            return 0;
+        const int slot = static_cast<int>(wlua::ToNumber(state, 1));
+        SlotHsl h{};
+        if (slot >= 0 && slot < kMaxEquipSlots)
+        {
+            std::lock_guard<std::mutex> lock(g_colorMutex);
+            h = g_slotHsl[slot];
+        }
+        if (!h.active || h.mode != 2)
+        {
+            wlua::PushNumber(state, 0.0);
+            return 1;
+        }
+        wlua::PushNumber(state, 1.0);
+        wlua::PushNumber(state, static_cast<double>(h.stopCount));
+        wlua::PushNumber(state, static_cast<double>(h.gradFill));
+        int n = 3;
+        for (uint8_t s = 0; s < h.stopCount && s < kMaxGradStops; ++s)
+        {
+            wlua::PushNumber(state, static_cast<double>(h.stops[s][0]));
+            wlua::PushNumber(state, static_cast<double>(h.stops[s][1]));
+            wlua::PushNumber(state, static_cast<double>(h.stops[s][2]));
+            n += 3;
+        }
+        // Also push base (hue/sat/light) for auto UI edit.
+        wlua::PushNumber(state, static_cast<double>(h.hue));
+        wlua::PushNumber(state, static_cast<double>(h.sat));
+        wlua::PushNumber(state, static_cast<double>(h.light));
+        return n + 3;
     }
 
     int __cdecl LuaRecolorSetSlotSelective(void* state)
@@ -2854,7 +4164,15 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
             }
 
             wlua::RegisterFunction("WXL_RecolorSetSlot", &LuaRecolorSetSlot);
+            wlua::RegisterFunction("WXL_RecolorSetSlotDraft", &LuaRecolorSetSlotDraft);
+            wlua::RegisterFunction("WXL_RecolorSetSlotGradient", &LuaRecolorSetSlotGradient);
+            wlua::RegisterFunction("WXL_RecolorSetSlotGradientDraft", &LuaRecolorSetSlotGradientDraft);
+            wlua::RegisterFunction("WXL_RecolorSetSlotSelectiveDraft", &LuaRecolorSetSlotSelectiveDraft);
+            wlua::RegisterFunction("WXL_RecolorApplyDraft", &LuaRecolorApplyDraft);
+            wlua::RegisterFunction("WXL_RecolorResetTint", &LuaRecolorResetTint);
+            wlua::RegisterFunction("WXL_RecolorGetSlotGradient", &LuaRecolorGetSlotGradient);
             wlua::RegisterFunction("WXL_RecolorSetSlotSelective", &LuaRecolorSetSlotSelective);
+            wlua::RegisterFunction("WXL_RecolorCatchSlotColors", &LuaRecolorCatchSlotColors);
             wlua::RegisterFunction("WXL_RecolorGetSlot", &LuaRecolorGetSlot);
             wlua::RegisterFunction("WXL_RecolorGetSlotTexPath", &LuaRecolorGetSlotTexPath);
             wlua::RegisterFunction("WXL_RecolorBakePreview", &LuaRecolorBakePreview);
@@ -2902,9 +4220,11 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
 
         void OnEndScene(const ev::EndSceneArgs& a)
         {
+            auto* dev = static_cast<IDirect3DDevice9*>(a.device);
+            FlushOcCatchPending(dev);
+
             if (!g_samplePending.exchange(false, std::memory_order_relaxed))
                 return;
-            auto* dev = static_cast<IDirect3DDevice9*>(a.device);
             if (!dev)
                 return;
 
@@ -2922,7 +4242,33 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
 
         void OnBatchDraw(const ev::M2BatchDrawArgs& a)
         {
-            if (a.phase != 1 || !a.model || !a.device || !AnySlotActive())
+            if (!a.model || !a.device)
+                return;
+
+            // Phase 0: sample OC albedo for Catch (bound texture, pre tint redraw).
+            // Phase 1: live mesh tint after native DIP.
+            if (a.phase == 0)
+            {
+                bool allowed = ModelInAllowedTree(a.model);
+                if (!allowed)
+                    allowed = TryCaptureUiOcRoot(a.model) && ModelInAllowedTree(a.model);
+                if (!allowed)
+                    return;
+                void* model = ResolveM2Model(a.model);
+                const char* stem = model ? m2::PathStem(model) : nullptr;
+                if (!PathLooksValid(stem))
+                    return;
+                int cands[4] = {};
+                const int nc = CandidateSlotsForOcPath(stem, cands, 4);
+                if (nc <= 0)
+                    return;
+                auto* dev = static_cast<IDirect3DDevice9*>(a.device);
+                for (int i = 0; i < nc; ++i)
+                    QueueOcCatchFromDevice(dev, cands[i], stem);
+                return;
+            }
+
+            if (a.phase != 1 || !AnySlotActive())
                 return;
 
             // Drop stale paperdoll OC roots when no UI is open — freed pointers can
@@ -2949,9 +4295,52 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
             if (!PathLooksValid(stem))
                 return;
 
+            // Draft tints only affect DressUp / UI preview meshes — not the world player.
+            bool previewDraw = false;
+            if (g_previewUiActive.load(std::memory_order_relaxed))
+            {
+                void* player = LocalPlayerBodyModel();
+                void* preview = g_previewModel.load(std::memory_order_relaxed);
+                void* cur = a.model;
+                for (int depth = 0; depth < 24 && cur; ++depth)
+                {
+                    if (player && cur == player)
+                    {
+                        previewDraw = false;
+                        break;
+                    }
+                    if (preview && cur == preview)
+                    {
+                        previewDraw = true;
+                        break;
+                    }
+                    bool uiHit = false;
+                    {
+                        std::lock_guard<std::mutex> lock(g_uiRootMu);
+                        for (int i = 0; i < g_uiOcRootN; ++i)
+                        {
+                            if (cur == g_uiOcRoots[i])
+                            {
+                                uiHit = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (uiHit)
+                    {
+                        previewDraw = true;
+                        break;
+                    }
+                    cur = wxl::game::unit::ModelParent(cur);
+                }
+            }
+            g_hslPreferDraft.store(previewDraw, std::memory_order_relaxed);
+
             SlotHsl hsl{};
             int usedSlot = -1;
-            if (!TryHslForPath(stem, hsl, &usedSlot))
+            const bool got = TryHslForPath(stem, hsl, &usedSlot);
+            g_hslPreferDraft.store(false, std::memory_order_relaxed);
+            if (!got)
                 return;
 
 
@@ -2978,9 +4367,21 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
 
         void OnTextureUpload(const ev::TextureUploadArgs& a)
         {
-            // OC live Hue uses OnBatchDraw mesh PS (Photoshop-style adjust).
-            // Do not bake HSL into GPU upload — that froze tint and hid Hue changes.
-            (void)a;
+            // Capture OC albedo pixels from the live mip table (TextureCreate path —
+            // SafeGetPal does not work on these handles). Fired AFTER native upload.
+            if (!a.texture || !a.width || !a.height)
+                return;
+            // Preview OC draws must not clobber the Catch bank used by /recolor.
+            if (g_previewUiActive.load(std::memory_order_relaxed)
+                && g_hslPreferDraft.load(std::memory_order_relaxed))
+                return;
+            const char* name = TextureName(a.texture);
+            if (!IsObjectComponentAlbedo(name))
+                return;
+            int cands[4] = {};
+            const int nc = CandidateSlotsForOcPath(name, cands, 4);
+            for (int i = 0; i < nc; ++i)
+                CaptureCatchFromMipTable(cands[i], name, a.width, a.height);
         }
 
     private:
@@ -3014,8 +4415,11 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
 
             IDirect3DPixelShader9* tintPs = nullptr;
             const bool selective = (hsl.mode == 1);
+            const bool solidGrad = (hsl.mode == 2 && hsl.stopCount >= 2);
             if (selective)
                 tintPs = EnsureSelectivePs(a.device);
+            else if (solidGrad)
+                tintPs = EnsureSolidGradPs(a.device);
             else
                 tintPs = EnsureSolidPs(a.device);
             const bool usePs = (tintPs != nullptr);
@@ -3076,6 +4480,25 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
                     // Critical: leaked c0..c8 corrupt later world/other-unit draws
                     // (skin/background "exploded") until client restart.
                     dev->SetPixelShaderConstantF(0, &oldConsts[0][0], 9);
+                }
+                else if (solidGrad)
+                {
+                    float consts[6][4] = {};
+                    consts[0][3] = static_cast<float>(hsl.stopCount);
+                    for (uint8_t s = 0; s < hsl.stopCount && s < kMaxGradStops; ++s)
+                    {
+                        consts[1 + s][0] = hsl.stops[s][0];
+                        consts[1 + s][1] = hsl.stops[s][1];
+                        consts[1 + s][2] = hsl.stops[s][2];
+                    }
+                    float oldConsts[6][4] = {};
+                    dev->GetPixelShaderConstantF(0, &oldConsts[0][0], 6);
+                    dev->SetPixelShader(tintPs);
+                    dev->SetPixelShaderConstantF(0, &consts[0][0], 6);
+                    gx::Device9(a.device).DrawIndexedPrimitive(
+                        a.primType, a.baseVertex, a.minIndex, a.numVerts,
+                        a.startIndex, a.primCount);
+                    dev->SetPixelShaderConstantF(0, &oldConsts[0][0], 6);
                 }
                 else
                 {
