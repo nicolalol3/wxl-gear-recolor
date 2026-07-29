@@ -1107,6 +1107,7 @@ frame:SetScript("OnShow", function()
     if type(WXL_RecolorSetPreviewActive) == "function" then
         WXL_RecolorSetPreviewActive(1)
     end
+    syncEquipSnap()
     model:SetUnit("player")
     model:Dress()
     applyModelCamera()
@@ -1164,12 +1165,32 @@ boot:RegisterEvent("VARIABLES_LOADED")
 boot:RegisterEvent("PLAYER_ENTERING_WORLD")
 boot:RegisterEvent("PLAYER_LEAVING_WORLD")
 
+local function syncEquipSnap()
+    if type(WXL_RecolorNoteEquip) ~= "function" then
+        return
+    end
+    if type(WXL_RecolorBeginEquipSnap) == "function" then
+        WXL_RecolorBeginEquipSnap()
+    end
+    local guid = UnitGUID("player")
+    if not guid then
+        return
+    end
+    for _, info in ipairs(EQUIP_SLOTS) do
+        local entry = GetInventoryItemID("player", info.slot)
+        WXL_RecolorNoteEquip(guid, info.slot, entry or 0)
+    end
+end
+
 local function scheduleWorldBodyRefresh()
     ensureDB()
+    syncEquipSnap()
     -- Sync SavedVariables → C++ only. Do NOT ForceBodyRebuild: that post-assembly
     -- 0x3FF rebuild is what made in-world look worse than char-select Enter World.
     pushAll(false)
 end
+
+boot:RegisterEvent("PLAYER_EQUIPMENT_CHANGED")
 
 boot:SetScript("OnEvent", function(_, event, arg1)
     if event == "ADDON_LOADED" and arg1 == ADDON_NAME then
@@ -1184,5 +1205,7 @@ boot:SetScript("OnEvent", function(_, event, arg1)
         scheduleWorldBodyRefresh()
     elseif event == "PLAYER_ENTERING_WORLD" then
         scheduleWorldBodyRefresh()
+    elseif event == "PLAYER_EQUIPMENT_CHANGED" then
+        syncEquipSnap()
     end
 end)

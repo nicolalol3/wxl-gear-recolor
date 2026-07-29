@@ -19,18 +19,12 @@ on `PLAYER_LOGIN` / `VARIABLES_LOADED`.
 
 ## What works (v1 stable)
 
-Tint is applied only to **`item\objectcomponents\`** meshes:
+Tint is applied only to **`item\objectcomponents\`** meshes (head / shoulders / weapons / shields)
+and to **`item\texturecomponents\`** body overlays (shirt, chest, waist, legs, feet, wrists, hands).
 
-- Head
-- Shoulders
-- Weapons (main-hand / off-hand melee; ranged by filename: bow/gun/wand/…)
-- Shields
-
-## What does not work yet
-
-Chest / legs / hands / feet / cloak / shirt / tabard live mostly on the character
-**composite texture (geoset 0)**, not as separate objectcomponent meshes. Safe body
-recolor is deferred — speculative texture mutation crashed the client.
+Body recolor tints the **source BLP** at CharComponent paste time (one TextureComponents layer
+per call), keyed by ItemDisplayInfo `texture[0..7]` for the equipped item — never the player
+composite or face/hair caches.
 
 ## Opt-out
 

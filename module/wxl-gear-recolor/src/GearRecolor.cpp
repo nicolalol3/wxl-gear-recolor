@@ -13,17 +13,24 @@
 //   WXL_RecolorForceBodyRebuild / WXL_RecolorClearSlot / WXL_RecolorClearAll
 //   WXL_RecolorCatchSlotColors(slot) -> n, then n*(r,g,b)  (selective Catch)
 //   WXL_RecolorArmScreenSample / GetScreenSample / CancelScreenSample
+//   WXL_RecolorSetRemote(guidStr, slot, mode, dataStr)  — observer sync from server
+//   WXL_RecolorClearRemote(guidStr[, slot])
+//   WXL_RecolorClearAllRemote()
 // State: mode 0 solid single, 1 selective, 2 solid gradient
 //   (legacy "slot r g b" still loads as solid single)
+// Runtime draw key: local slots OR (ownerGuid, slot) for remotes — never path-only.
 
 #include "core/Logger.hpp"
 #include "core/Hook.hpp"
 #include "events/EventScript.hpp"
+#include "game/Binding.hpp"
 #include "game/gx/Gx.hpp"
 #include "game/m2/M2.hpp"
 #include "game/unit/Unit.hpp"
 #include "game/world/World.hpp"
 #include "offsets/engine/Gx.hpp"
+#include "offsets/game/DB2.hpp"
+#include "offsets/game/M2.hpp"
 #include "runtime/LuaBindings.hpp"
 #include "runtime/ModuleInstall.hpp"
 
@@ -31,14 +38,15 @@
 #include <d3d9.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
-#include <unordered_map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace
@@ -66,6 +74,55 @@ namespace
             return 1.f;
         return v;
     }
+
+    // #region agent log
+    constexpr char kDbgLog615[] = "C:\\Azerothcore\\debug-615e3b.log";
+    std::atomic<uint32_t> g_dbgPasteRemoteN{ 0 };
+    std::atomic<uint32_t> g_dbgTryHslN{ 0 };
+    std::atomic<uint32_t> g_dbgApplyRemoteN{ 0 };
+    std::atomic<uint32_t> g_dbgNoteEquipN{ 0 };
+    std::atomic<uint32_t> g_dbgForceRebuildN{ 0 };
+
+    void DbgTexBasename615(const char* path, char* out, size_t n)
+    {
+        if (!out || n == 0)
+            return;
+        out[0] = '\0';
+        if (!path)
+            return;
+        const char* base = path;
+        for (const char* p = path; *p; ++p)
+        {
+            if (*p == '\\' || *p == '/')
+                base = p + 1;
+        }
+        size_t len = std::strlen(base);
+        if (len >= n)
+            len = n - 1;
+        std::memcpy(out, base, len);
+        out[len] = '\0';
+    }
+
+    void DbgLog615(const char* hypothesisId, const char* location, const char* message,
+        unsigned long long owner, int slot, int section, const char* texStem,
+        int extraA, int extraB, uintptr_t extraPtr = 0)
+    {
+        FILE* f = nullptr;
+        if (fopen_s(&f, kDbgLog615, "a") != 0 || !f)
+            return;
+        const unsigned long long ts = static_cast<unsigned long long>(GetTickCount64());
+        fprintf(f,
+            "{\"sessionId\":\"615e3b\",\"runId\":\"no-remote-force\",\"hypothesisId\":\"%s\","
+            "\"location\":\"%s\",\"message\":\"%s\",\"timestamp\":%llu,"
+            "\"data\":{\"ownerLow\":%u,\"slot\":%d,\"section\":%d,"
+            "\"a\":%d,\"b\":%d,\"ptr\":%llu,\"tex\":\"%s\"}}\n",
+            hypothesisId, location, message, ts,
+            static_cast<unsigned>(owner & 0xFFFFFFFFull), slot, section,
+            extraA, extraB, static_cast<unsigned long long>(extraPtr),
+            texStem ? texStem : "");
+        fclose(f);
+    }
+    // #endregion
 
     // Fields named hue/sat/light for legacy call sites; values are RGB 0..1.
     // mode 0 = solid single (lum * dest)
@@ -228,11 +285,385 @@ namespace
 
     std::mutex g_colorMutex;
     SlotHsl g_slotHsl[kMaxEquipSlots];
-    // Draft tints: paperdoll/DressUp only until Lua Apply commits to g_slotHsl.
+    // /recolor UI preview — never synced to server or remote observers until Apply.
     SlotHsl g_draftHsl[kMaxEquipSlots];
-    std::atomic<bool> g_hslPreferDraft{ false };
+    std::atomic<bool> g_previewUiActive{ false };
+
+    // Remote players' equipped tints (owner = full client GUID). Local keeps g_slotHsl
+    // as hot cache for ActiveOwnerGuid(); both written via ApplyOwnerTint.
+    using OwnerGuid = unsigned long long;
+    using OwnerSlotHsl = std::array<SlotHsl, kMaxEquipSlots>;
+    std::mutex g_remoteMu;
+    std::unordered_map<OwnerGuid, OwnerSlotHsl> g_remoteTints;
+    // CharacterComponent.model for remote owners (OC attaches here, not unit+0xB4).
+    std::unordered_map<OwnerGuid, void*> g_remoteCcModels;
+    std::unordered_map<OwnerGuid, void*> g_remoteCcComponents;
+    // Every CharComponent RenderPrep: model → component (local + remote).
+    std::unordered_map<void*, void*> g_modelToComponent;
+    // Remote tint arrived before unit visible — section mask to Force on next prep.
+    std::unordered_map<OwnerGuid, uint32_t> g_remotePendingDirty;
+    // CharComponent assemble owner for the current paste window.
+    std::atomic<OwnerGuid> g_prepOwnerGuid{ 0 };
+
+    bool GuidSamePlayer(OwnerGuid a, OwnerGuid b)
+    {
+        if (!a || !b)
+            return false;
+        if (a == b)
+            return true;
+        return (a & 0xFFFFFFFFull) == (b & 0xFFFFFFFFull);
+    }
+
+    // ActivePlayerGuid() often returns 0 on the render thread. Cache from Lua.
+    std::atomic<OwnerGuid> g_cachedSelfGuid{ 0 };
+
+    std::mutex g_equipSnapMu;
+    // owner -> per-slot item entry (0 = empty or unknown). Filled by Lua PUSH.
+    std::unordered_map<OwnerGuid, std::array<uint32_t, kMaxEquipSlots>> g_equipSnap;
+
+    // ItemDisplayInfo-backed identity for TextureComponents paste tint.
+    // One stem per texture[0..7] (ArmUpper..Foot) — never ModelTexture tex1/tex2.
+    constexpr size_t kStemCap = 64;
+    struct DisplaySlotInfo
+    {
+        uint32_t displayId = 0;
+        char componentStems[8][kStemCap] = {};
+    };
+    using OwnerDisplaySlots = std::array<DisplaySlotInfo, kMaxEquipSlots>;
+    std::mutex g_displayMu;
+    std::unordered_map<OwnerGuid, OwnerDisplaySlots> g_displaySnap;
 
     constexpr char kStateFile[] = "WarcraftXL_gear-recolor.state";
+
+    // Per-character disk cache (shared Wow.exe folder — two clients must not share
+    // one slot table or login sync copies the same tints onto both characters).
+    void StateFileForOwner(OwnerGuid owner, char* out, size_t outN)
+    {
+        if (owner)
+            sprintf_s(out, outN, "WarcraftXL_gear-recolor_%I64u.state",
+                static_cast<unsigned long long>(owner));
+        else
+            sprintf_s(out, outN, "%s", kStateFile);
+    }
+
+    OwnerGuid ActiveOwnerGuid()
+    {
+        const OwnerGuid live = static_cast<OwnerGuid>(wxl::game::world::ActivePlayerGuid());
+        if (live)
+        {
+            g_cachedSelfGuid.store(live, std::memory_order_relaxed);
+            return live;
+        }
+        return g_cachedSelfGuid.load(std::memory_order_relaxed);
+    }
+
+    bool ParseGuidString(const char* s, OwnerGuid& out)
+    {
+        if (!s || !s[0])
+            return false;
+        while (*s == ' ' || *s == '\t')
+            ++s;
+        if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
+            s += 2;
+        char* end = nullptr;
+        const unsigned long long v = _strtoui64(s, &end, 16);
+        if (end == s)
+            return false;
+        out = static_cast<OwnerGuid>(v);
+        return out != 0;
+    }
+
+    bool OwnerHasAnyTintLocked(const OwnerSlotHsl& slots)
+    {
+        for (int i = 0; i < kMaxEquipSlots; ++i)
+        {
+            if (slots[static_cast<size_t>(i)].active)
+                return true;
+        }
+        return false;
+    }
+
+    bool OwnerHasAnyRemoteTint(OwnerGuid owner)
+    {
+        std::lock_guard<std::mutex> lock(g_remoteMu);
+        auto it = g_remoteTints.find(owner);
+        if (it != g_remoteTints.end() && OwnerHasAnyTintLocked(it->second))
+            return true;
+        for (const auto& kv : g_remoteTints)
+        {
+            if (GuidSamePlayer(kv.first, owner) && OwnerHasAnyTintLocked(kv.second))
+                return true;
+        }
+        return false;
+    }
+
+    bool FormatTintData(const SlotHsl& h, char* out, size_t cap)
+    {
+        if (!out || cap < 8 || !h.active)
+            return false;
+        if (h.mode == 0)
+        {
+            return _snprintf_s(out, cap, _TRUNCATE, "%.6f %.6f %.6f",
+                h.hue, h.sat, h.light) > 0;
+        }
+        if (h.mode == 2)
+        {
+            int n = _snprintf_s(out, cap, _TRUNCATE, "%u %u",
+                static_cast<unsigned>(h.stopCount),
+                static_cast<unsigned>(h.gradFill));
+            if (n <= 0)
+                return false;
+            size_t used = static_cast<size_t>(n);
+            if (h.gradFill == 0)
+            {
+                n = _snprintf_s(out + used, cap - used, _TRUNCATE,
+                    " %.6f %.6f %.6f", h.hue, h.sat, h.light);
+                return n > 0;
+            }
+            for (uint8_t s = 0; s < h.stopCount && s < kMaxGradStops; ++s)
+            {
+                n = _snprintf_s(out + used, cap - used, _TRUNCATE,
+                    " %.6f %.6f %.6f",
+                    h.stops[s][0], h.stops[s][1], h.stops[s][2]);
+                if (n <= 0)
+                    return false;
+                used += static_cast<size_t>(n);
+            }
+            return true;
+        }
+        // Selective
+        uint8_t nRules = h.ruleCount ? h.ruleCount : 1;
+        int n = _snprintf_s(out, cap, _TRUNCATE, "%u", static_cast<unsigned>(nRules));
+        if (n <= 0)
+            return false;
+        size_t used = static_cast<size_t>(n);
+        if (h.ruleCount == 0)
+        {
+            n = _snprintf_s(out + used, cap - used, _TRUNCATE,
+                " %.6f %.6f %.6f %.6f %.6f %.6f %.6f",
+                h.srcR, h.srcG, h.srcB, h.hue, h.sat, h.light, h.tolerance);
+            return n > 0;
+        }
+        for (uint8_t r = 0; r < nRules; ++r)
+        {
+            const SelRule& rule = h.rules[r];
+            n = _snprintf_s(out + used, cap - used, _TRUNCATE,
+                " %.6f %.6f %.6f %.6f %.6f %.6f %.6f",
+                rule.sr, rule.sg, rule.sb, rule.dr, rule.dg, rule.db, rule.tol);
+            if (n <= 0)
+                return false;
+            used += static_cast<size_t>(n);
+        }
+        return true;
+    }
+
+    // Resolve to the map key used by Lua PUSH / g_remoteTints (high bits may differ).
+    OwnerGuid CanonicalTintOwner(OwnerGuid owner)
+    {
+        if (!owner)
+            return 0;
+        {
+            std::lock_guard<std::mutex> lock(g_equipSnapMu);
+            if (g_equipSnap.find(owner) != g_equipSnap.end())
+                return owner;
+            for (const auto& kv : g_equipSnap)
+            {
+                if (GuidSamePlayer(kv.first, owner))
+                    return kv.first;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_remoteMu);
+            if (g_remoteTints.find(owner) != g_remoteTints.end())
+                return owner;
+            for (const auto& kv : g_remoteTints)
+            {
+                if (GuidSamePlayer(kv.first, owner))
+                    return kv.first;
+            }
+        }
+        return owner;
+    }
+
+    uint32_t EquipSnapEntry(OwnerGuid owner, int slot)
+    {
+        if (!owner || slot < 0 || slot >= kMaxEquipSlots)
+            return 0;
+        owner = CanonicalTintOwner(owner);
+        std::lock_guard<std::mutex> lock(g_equipSnapMu);
+        auto it = g_equipSnap.find(owner);
+        if (it == g_equipSnap.end())
+            return 0;
+        return it->second[static_cast<size_t>(slot)];
+    }
+
+    bool EquipSnapKnown(OwnerGuid owner)
+    {
+        if (!owner)
+            return false;
+        std::lock_guard<std::mutex> lock(g_equipSnapMu);
+        if (g_equipSnap.find(owner) != g_equipSnap.end())
+            return true;
+        for (const auto& kv : g_equipSnap)
+        {
+            if (GuidSamePlayer(kv.first, owner))
+                return true;
+        }
+        return false;
+    }
+
+    bool ParseTintData(uint8_t mode, const char* data, SlotHsl& out)
+    {
+        out = {};
+        if (!data)
+            return false;
+        out.active = true;
+        out.mode = mode;
+        if (mode == 0)
+        {
+            float r = 0.f, g = 0.f, b = 0.f;
+            if (sscanf_s(data, "%f %f %f", &r, &g, &b) != 3)
+                return false;
+            out.hue = Clamp01(r);
+            out.sat = Clamp01(g);
+            out.light = Clamp01(b);
+            return true;
+        }
+        if (mode == 2)
+        {
+            unsigned nStops = 0, fill = 0;
+            const char* p = data;
+            if (sscanf_s(p, "%u %u", &nStops, &fill) != 2)
+                return false;
+            while (*p && *p != ' ')
+                ++p;
+            while (*p == ' ')
+                ++p;
+            while (*p && *p != ' ')
+                ++p;
+            while (*p == ' ')
+                ++p;
+            if (nStops != 2 && nStops != 3 && nStops != 5)
+                nStops = 3;
+            out.stopCount = static_cast<uint8_t>(nStops);
+            out.gradFill = fill ? 1 : 0;
+            if (out.gradFill == 0)
+            {
+                float r = 0.f, g = 0.f, b = 0.f;
+                if (sscanf_s(p, "%f %f %f", &r, &g, &b) != 3)
+                    return false;
+                out.hue = Clamp01(r);
+                out.sat = Clamp01(g);
+                out.light = Clamp01(b);
+                FillAutoStops(out.hue, out.sat, out.light, out.stopCount, out.stops);
+                return true;
+            }
+            for (uint8_t s = 0; s < out.stopCount; ++s)
+            {
+                float r = 0.f, g = 0.f, b = 0.f;
+                int consumed = 0;
+                if (sscanf_s(p, "%f %f %f%n", &r, &g, &b, &consumed) < 3)
+                    return false;
+                out.stops[s][0] = Clamp01(r);
+                out.stops[s][1] = Clamp01(g);
+                out.stops[s][2] = Clamp01(b);
+                p += consumed;
+            }
+            out.hue = out.stops[0][0];
+            out.sat = out.stops[0][1];
+            out.light = out.stops[0][2];
+            return true;
+        }
+        // Selective
+        unsigned nRules = 0;
+        const char* p = data;
+        int consumed = 0;
+        if (sscanf_s(p, "%u%n", &nRules, &consumed) != 1 || nRules == 0 || nRules > kMaxSelRules)
+            return false;
+        p += consumed;
+        out.ruleCount = static_cast<uint8_t>(nRules);
+        for (uint8_t i = 0; i < out.ruleCount; ++i)
+        {
+            float sr, sg, sb, dr, dg, db, tol;
+            consumed = 0;
+            if (sscanf_s(p, "%f %f %f %f %f %f %f%n",
+                &sr, &sg, &sb, &dr, &dg, &db, &tol, &consumed) < 7)
+                return false;
+            out.rules[i].sr = Clamp01(sr);
+            out.rules[i].sg = Clamp01(sg);
+            out.rules[i].sb = Clamp01(sb);
+            out.rules[i].dr = Clamp01(dr);
+            out.rules[i].dg = Clamp01(dg);
+            out.rules[i].db = Clamp01(db);
+            out.rules[i].tol = Clamp01(tol);
+            p += consumed;
+        }
+        SyncSlotMirrorsFromLastRule(out);
+        return true;
+    }
+
+    void SetRemoteSlotTint(OwnerGuid owner, int slot, const SlotHsl& h)
+    {
+        if (!owner || slot < 0 || slot >= kMaxEquipSlots)
+            return;
+        {
+            std::lock_guard<std::mutex> lock(g_remoteMu);
+            g_remoteTints[owner][static_cast<size_t>(slot)] = h;
+        }
+    }
+
+    void ClearRemoteSlotTint(OwnerGuid owner, int slot)
+    {
+        if (!owner)
+            return;
+        {
+            std::lock_guard<std::mutex> lock(g_remoteMu);
+            auto it = g_remoteTints.find(owner);
+            if (it != g_remoteTints.end())
+            {
+                if (slot < 0)
+                {
+                    g_remoteTints.erase(it);
+                    g_remoteCcModels.erase(owner);
+                    g_remoteCcComponents.erase(owner);
+                }
+                else if (slot < kMaxEquipSlots)
+                {
+                    it->second[static_cast<size_t>(slot)] = {};
+                    if (!OwnerHasAnyTintLocked(it->second))
+                    {
+                        g_remoteTints.erase(it);
+                        g_remoteCcModels.erase(owner);
+                        g_remoteCcComponents.erase(owner);
+                    }
+                }
+            }
+        }
+        // Keep equip snap aligned: empty/clear must not leave a stale entry that
+        // lets paste re-tint feet after unequip (observer phantom boots).
+        {
+            std::lock_guard<std::mutex> lock(g_equipSnapMu);
+            auto it = g_equipSnap.find(owner);
+            if (it == g_equipSnap.end())
+                return;
+            if (slot < 0)
+            {
+                g_equipSnap.erase(it);
+                return;
+            }
+            if (slot < kMaxEquipSlots)
+                it->second[static_cast<size_t>(slot)] = 0;
+        }
+    }
+
+    void ClearAllRemoteTints()
+    {
+        std::lock_guard<std::mutex> lock(g_remoteMu);
+        g_remoteTints.clear();
+        g_remoteCcModels.clear();
+        g_remoteCcComponents.clear();
+        g_remotePendingDirty.clear();
+    }
 
     bool IsIdentityHsl(const SlotHsl& h)
     {
@@ -444,8 +875,10 @@ namespace
 
     void SaveHslToDisk()
     {
+        char path[128];
+        StateFileForOwner(ActiveOwnerGuid(), path, sizeof(path));
         FILE* f = nullptr;
-        if (fopen_s(&f, kStateFile, "w") != 0 || !f)
+        if (fopen_s(&f, path, "w") != 0 || !f)
             return;
         std::lock_guard<std::mutex> lock(g_colorMutex);
         for (int i = 0; i < kMaxEquipSlots; ++i)
@@ -501,173 +934,6 @@ namespace
         fclose(f);
     }
 
-    void LoadHslFromDisk()
-    {
-        FILE* f = nullptr;
-        if (fopen_s(&f, kStateFile, "r") != 0 || !f)
-            return;
-        int n = 0;
-        char line[320];
-        while (fgets(line, sizeof(line), f))
-        {
-            int slot = 0;
-            float t0 = 0.f, t1 = 0.f, t2 = 0.f, t3 = 0.f;
-            const int nProbe = sscanf_s(line, "%d %f %f %f %f", &slot, &t0, &t1, &t2, &t3);
-            if (slot < 0 || slot >= kMaxEquipSlots)
-                continue;
-
-            SlotHsl h{};
-            h.active = true;
-
-            if (nProbe == 4)
-            {
-                // Legacy: slot r g b
-                if (t0 > 1.01f || t1 > 1.01f || t2 > 1.01f || t2 < -0.01f)
-                    continue;
-                h.mode = 0;
-                h.hue = Clamp01(t0);
-                h.sat = Clamp01(t1);
-                h.light = Clamp01(t2);
-            }
-            else
-            {
-                int mode = 0;
-                int count = 0;
-                // Chained selective: "slot 1 <count:1..4> sr sg sb dr dg db tol ..."
-                // (old "slot 1 destR ..." yields count=0 via %d truncation → legacy path)
-                const int nHead = sscanf_s(line, "%d %d %d", &slot, &mode, &count);
-                if (nHead == 3 && mode == 2 && (count == 2 || count == 3 || count == 5))
-                {
-                    // Solid gradient: slot 2 <nStops> <fill> then colors
-                    int fill = 0;
-                    const char* p = line;
-                    for (int tok = 0; tok < 2 && p && *p; ++tok)
-                    {
-                        while (*p == ' ' || *p == '\t')
-                            ++p;
-                        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
-                            ++p;
-                    }
-                    int nReadHead = 0;
-                    if (sscanf_s(p, " %d %d%n", &count, &fill, &nReadHead) < 2 || nReadHead <= 0)
-                        continue;
-                    p += nReadHead;
-                    h.mode = 2;
-                    h.stopCount = static_cast<uint8_t>(count);
-                    h.gradFill = (fill != 0) ? 1 : 0;
-                    if (h.gradFill == 0)
-                    {
-                        float br = 0.f, bg = 0.f, bb = 0.f;
-                        if (sscanf_s(p, " %f %f %f", &br, &bg, &bb) < 3)
-                            continue;
-                        h.hue = Clamp01(br);
-                        h.sat = Clamp01(bg);
-                        h.light = Clamp01(bb);
-                    }
-                    else
-                    {
-                        for (int s = 0; s < count; ++s)
-                        {
-                            float sr = 0.f, sg = 0.f, sb = 0.f;
-                            int nRead = 0;
-                            if (sscanf_s(p, " %f %f %f%n", &sr, &sg, &sb, &nRead) < 3
-                                || nRead <= 0)
-                            {
-                                h.active = false;
-                                break;
-                            }
-                            p += nRead;
-                            h.stops[s][0] = Clamp01(sr);
-                            h.stops[s][1] = Clamp01(sg);
-                            h.stops[s][2] = Clamp01(sb);
-                        }
-                        if (!h.active)
-                            continue;
-                    }
-                    ResolveSolidStops(h);
-                }
-                else if (nHead == 3 && mode == 1 && count >= 1 && count <= kMaxSelRules)
-                {
-                    h.mode = 1;
-                    h.ruleCount = 0;
-                    const char* p = line;
-                    // skip slot, mode, count tokens
-                    for (int tok = 0; tok < 3 && p && *p; ++tok)
-                    {
-                        while (*p == ' ' || *p == '\t')
-                            ++p;
-                        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
-                            ++p;
-                    }
-                    for (int r = 0; r < count; ++r)
-                    {
-                        float sr = 0.f, sg = 0.f, sb = 0.f;
-                        float dr = 0.f, dg = 0.f, db = 0.f, tol = 0.35f;
-                        int nRead = 0;
-                        if (sscanf_s(p, " %f %f %f %f %f %f %f%n",
-                                &sr, &sg, &sb, &dr, &dg, &db, &tol, &nRead) < 7 || nRead <= 0)
-                            break;
-                        p += nRead;
-                        SelRule rule{};
-                        rule.sr = Clamp01(sr);
-                        rule.sg = Clamp01(sg);
-                        rule.sb = Clamp01(sb);
-                        rule.dr = Clamp01(dr);
-                        rule.dg = Clamp01(dg);
-                        rule.db = Clamp01(db);
-                        rule.tol = Clamp01(tol);
-                        if (rule.tol < 0.02f)
-                            rule.tol = 0.35f;
-                        h.rules[h.ruleCount++] = rule;
-                    }
-                    if (h.ruleCount == 0)
-                        continue;
-                    SyncSlotMirrorsFromLastRule(h);
-                }
-                else
-                {
-                    float a = 1.f, b = 1.f, c = 1.f, d = 0.f, e = 0.f, f2 = 0.f, tol = 0.35f;
-                    const int nNew = sscanf_s(line, "%d %d %f %f %f %f %f %f %f",
-                        &slot, &mode, &a, &b, &c, &d, &e, &f2, &tol);
-                    if (nNew < 5 || slot < 0 || slot >= kMaxEquipSlots)
-                        continue;
-                    if (a > 1.01f || b > 1.01f || c > 1.01f)
-                        continue;
-                    h.mode = (mode == 1) ? 1 : 0;
-                    h.hue = Clamp01(a);
-                    h.sat = Clamp01(b);
-                    h.light = Clamp01(c);
-                    if (h.mode == 1)
-                    {
-                        if (nNew < 9)
-                            continue;
-                        // Legacy single-rule: dest then src then tol
-                        h.srcR = Clamp01(d);
-                        h.srcG = Clamp01(e);
-                        h.srcB = Clamp01(f2);
-                        h.tolerance = Clamp01(tol);
-                        if (h.tolerance < 0.02f)
-                            h.tolerance = 0.35f;
-                        h.rules[0].sr = h.srcR;
-                        h.rules[0].sg = h.srcG;
-                        h.rules[0].sb = h.srcB;
-                        h.rules[0].dr = h.hue;
-                        h.rules[0].dg = h.sat;
-                        h.rules[0].db = h.light;
-                        h.rules[0].tol = h.tolerance;
-                        h.ruleCount = 1;
-                    }
-                }
-            }
-
-            std::lock_guard<std::mutex> lock(g_colorMutex);
-            g_slotHsl[slot] = h;
-            ++n;
-        }
-        fclose(f);
-        if (n > 0)
-            WLOG_INFO("gear-recolor: loaded {} slot tint(s) from {}", n, kStateFile);
-    }
 
     bool ContainsCI(const char* hay, const char* needle)
     {
@@ -691,6 +957,303 @@ namespace
                 return true;
         }
         return false;
+    }
+
+    // --- ItemDisplayInfo stem cache (TextureComponents identity) ---------------
+
+    namespace db2 = wxl::offsets::game::db2;
+    using wxl::game::Native;
+
+    void CopyTexStem(const char* src, char* dst, size_t dstN)
+    {
+        if (!dst || dstN == 0)
+            return;
+        dst[0] = '\0';
+        if (!src || !src[0])
+            return;
+        if (reinterpret_cast<uintptr_t>(src) < 0x10000u)
+            return;
+        const char* base = src;
+        for (const char* p = src; *p; ++p)
+        {
+            if (*p == '\\' || *p == '/')
+                base = p + 1;
+        }
+        size_t len = std::strlen(base);
+        for (size_t i = 0; i < len; ++i)
+        {
+            if (base[i] == '.')
+            {
+                len = i;
+                break;
+            }
+        }
+        if (len < 2)
+            return;
+        if (len >= dstN)
+            len = dstN - 1;
+        std::memcpy(dst, base, len);
+        dst[len] = '\0';
+    }
+
+    bool DisplaySlotHasComponentTextures(const DisplaySlotInfo& info)
+    {
+        for (int i = 0; i < 8; ++i)
+        {
+            if (info.componentStems[i][0])
+                return true;
+        }
+        return false;
+    }
+
+    void DisplayInfoSetComponentStem(DisplaySlotInfo& info, int compIdx, const char* texName)
+    {
+        if (compIdx < 0 || compIdx >= 8)
+            return;
+        CopyTexStem(texName, info.componentStems[compIdx], kStemCap);
+    }
+
+    bool FillDisplayInfoFromId(uint32_t displayId, DisplaySlotInfo& out)
+    {
+        out = {};
+        if (!displayId)
+            return false;
+        alignas(4) uint8_t dispBuf[db2::itemdisplayinfo::kRecordSize] = {};
+        uint32_t ok = 0;
+        __try
+        {
+            ok = Native<db2::itemdisplayinfo::LookupFn>(db2::itemdisplayinfo::kLookup)(
+                reinterpret_cast<void*>(db2::itemdisplayinfo::kStorageObject),
+                nullptr, displayId, dispBuf);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+        if (!ok)
+            return false;
+        out.displayId = displayId;
+        __try
+        {
+            for (size_t i = 0; i < db2::itemdisplayinfo::kComponentTexCount; ++i)
+            {
+                const char* tex = *reinterpret_cast<const char**>(
+                    dispBuf + db2::itemdisplayinfo::kOffComponentTex0 + i * sizeof(void*));
+                DisplayInfoSetComponentStem(out, static_cast<int>(i), tex);
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            out = {};
+            out.displayId = displayId;
+        }
+        return DisplaySlotHasComponentTextures(out) || out.displayId != 0;
+    }
+
+    uint32_t DisplayIdFromItemEntrySeh(uint32_t entry) noexcept
+    {
+        if (!entry)
+            return 0;
+        uint32_t displayId = 0;
+        __try
+        {
+            const uint32_t low = *reinterpret_cast<uint32_t*>(db2::item::kMinId);
+            const uint32_t high = *reinterpret_cast<uint32_t*>(db2::item::kMaxId);
+            if (entry < low || entry > high)
+                return 0;
+            uint8_t* idTable = *reinterpret_cast<uint8_t**>(db2::item::kIdTable);
+            if (!idTable)
+                return 0;
+            void* rec = *reinterpret_cast<void**>(idTable + (entry - low) * sizeof(void*));
+            if (!rec)
+                return 0;
+            displayId = *reinterpret_cast<uint32_t*>(
+                static_cast<uint8_t*>(rec) + db2::item::kOffDisplayInfoId);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return 0;
+        }
+        return displayId;
+    }
+
+    void ClearDisplaySlot(OwnerGuid owner, int slot)
+    {
+        if (!owner || slot < 0 || slot >= kMaxEquipSlots)
+            return;
+        std::lock_guard<std::mutex> lock(g_displayMu);
+        auto it = g_displaySnap.find(owner);
+        if (it == g_displaySnap.end())
+            return;
+        it->second[static_cast<size_t>(slot)] = {};
+    }
+
+    void SetDisplaySlotFromDisplayId(OwnerGuid owner, int slot, uint32_t displayId)
+    {
+        if (!owner || slot < 0 || slot >= kMaxEquipSlots)
+            return;
+        DisplaySlotInfo info{};
+        if (displayId)
+            FillDisplayInfoFromId(displayId, info);
+        std::lock_guard<std::mutex> lock(g_displayMu);
+        g_displaySnap[owner][static_cast<size_t>(slot)] = info;
+    }
+
+    void SetDisplaySlotFromItemEntry(OwnerGuid owner, int slot, uint32_t entry)
+    {
+        if (!owner || slot < 0 || slot >= kMaxEquipSlots)
+            return;
+        if (entry == 0)
+        {
+            ClearDisplaySlot(owner, slot);
+            return;
+        }
+        SetDisplaySlotFromDisplayId(owner, slot, DisplayIdFromItemEntrySeh(entry));
+    }
+
+    bool GetDisplaySlotInfo(OwnerGuid owner, int slot, DisplaySlotInfo& out)
+    {
+        out = {};
+        if (!owner || slot < 0 || slot >= kMaxEquipSlots)
+            return false;
+        std::lock_guard<std::mutex> lock(g_displayMu);
+        auto it = g_displaySnap.find(owner);
+        if (it == g_displaySnap.end())
+        {
+            for (const auto& kv : g_displaySnap)
+            {
+                if (GuidSamePlayer(kv.first, owner))
+                {
+                    out = kv.second[static_cast<size_t>(slot)];
+                    return out.displayId != 0 || DisplaySlotHasComponentTextures(out);
+                }
+            }
+            return false;
+        }
+        out = it->second[static_cast<size_t>(slot)];
+        return out.displayId != 0 || DisplaySlotHasComponentTextures(out);
+    }
+
+    // DBC texture[i] is a base name; runtime BLP adds _RaceGender (e.g. Chest_TU → Chest_TU_F).
+    bool DbcStemMatchesPathStem(const char* pathStem, const char* dbcStem)
+    {
+        if (!pathStem || !dbcStem || !pathStem[0] || !dbcStem[0])
+            return false;
+        if (_stricmp(pathStem, dbcStem) == 0)
+            return true;
+        const size_t n = std::strlen(dbcStem);
+        if (_strnicmp(pathStem, dbcStem, n) != 0)
+            return false;
+        const char next = pathStem[n];
+        return next == '\0' || next == '_';
+    }
+
+    bool PathMatchesSlotComponent(const char* path, const DisplaySlotInfo& info, int compIdx)
+    {
+        if (compIdx < 0 || compIdx >= 8 || !path || !path[0])
+            return false;
+        const char* slotStem = info.componentStems[compIdx];
+        if (!slotStem[0])
+            return false;
+        char pathStem[kStemCap] = {};
+        CopyTexStem(path, pathStem, sizeof(pathStem));
+        return pathStem[0] && DbcStemMatchesPathStem(pathStem, slotStem);
+    }
+
+    bool PathMatchesAnyStem(const char* path, const DisplaySlotInfo& info)
+    {
+        if (!path || !path[0])
+            return false;
+        for (int i = 0; i < 8; ++i)
+        {
+            if (PathMatchesSlotComponent(path, info, i))
+                return true;
+        }
+        return false;
+    }
+
+    // ItemDisplayInfo texture[0..7] → composite paste section (CharComponent).
+    int ComponentIndexFromTexturePath(const char* path)
+    {
+        if (!path)
+            return -1;
+        if (ContainsCI(path, "sleeve") || ContainsCI(path, "armupper"))
+            return 0;
+        if (ContainsCI(path, "bracer") || ContainsCI(path, "armlower"))
+            return 1;
+        if (ContainsCI(path, "glove_ha") || ContainsCI(path, "_ha_"))
+            return 2;
+        if (ContainsCI(path, "handtexture") || ContainsCI(path, "\\hand\\")
+            || ContainsCI(path, "/hand/"))
+            return 2;
+        if (ContainsCI(path, "torsoupper") || ContainsCI(path, "chest_tu"))
+            return 3;
+        if (ContainsCI(path, "torsolower") || ContainsCI(path, "chest_tl"))
+            return 4;
+        if (ContainsCI(path, "legupper") || ContainsCI(path, "pant_lu")
+            || ContainsCI(path, "robe_lu") || ContainsCI(path, "belt"))
+            return 5;
+        if (ContainsCI(path, "leglower") || ContainsCI(path, "pant_ll")
+            || ContainsCI(path, "robe_ll") || ContainsCI(path, "boot_ll"))
+            return 6;
+        if (ContainsCI(path, "foottexture") || ContainsCI(path, "\\foot\\")
+            || ContainsCI(path, "/foot/") || ContainsCI(path, "boot_fo"))
+            return 7;
+        if (ContainsCI(path, "glove") && ContainsCI(path, "_al_"))
+            return 1;
+        return -1;
+    }
+
+    void CandidateEquipSlotsForComponent(int compIdx, int* outSlots, int& outN)
+    {
+        outN = 0;
+        if (!outSlots || compIdx < 0 || compIdx >= 8)
+            return;
+        auto push = [&](int s) {
+            if (outN < 4)
+                outSlots[outN++] = s;
+        };
+        switch (compIdx)
+        {
+        case 0: case 1: push(8); break;              // bracers
+        case 2: push(9); break;                      // hands
+        case 3: case 4: push(3); push(4); break;     // shirt + chest
+        case 5: push(5); push(6); break;             // waist + legs
+        case 6: push(6); break;
+        case 7: push(7); break;                      // feet
+        default: break;
+        }
+    }
+
+
+    // Internal model slot (0-10 from OnItemSlotChange) → WoW EQUIPMENT_SLOT_*.
+    int ModelSlotToEquipSlot(uint32_t modelSlot)
+    {
+        switch (modelSlot)
+        {
+        case 0:  return 0;
+        case 1:  return 2;
+        case 2:  return 3;
+        case 3:  return 4;
+        case 4:  return 5;
+        case 5:  return 6;
+        case 6:  return 7;
+        case 7:  return 8;
+        case 8:  return 9;
+        case 9:  return 14;
+        case 10: return 18;
+        default: return -1;
+        }
+    }
+
+    uint32_t GuardedDisplayIdFromItemData(void* itemDataPtr) noexcept
+    {
+        if (!itemDataPtr)
+            return 0;
+        uint32_t v = 0;
+        __try { v = *static_cast<uint32_t*>(itemDataPtr); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        return v;
     }
 
     bool PathLooksValid(const char* s)
@@ -784,13 +1347,172 @@ namespace
         return n;
     }
 
+    void ClearDraftSlot(int slot)
+    {
+        if (slot < 0 || slot >= kMaxEquipSlots)
+            return;
+        std::lock_guard<std::mutex> lock(g_colorMutex);
+        g_draftHsl[slot] = {};
+    }
+
+    void ClearAllDrafts()
+    {
+        std::lock_guard<std::mutex> lock(g_colorMutex);
+        for (int i = 0; i < kMaxEquipSlots; ++i)
+            g_draftHsl[i] = {};
+    }
+
+    void WriteLocalSlotHsl(int slot, const SlotHsl& h)
+    {
+        if (slot < 0 || slot >= kMaxEquipSlots)
+            return;
+        std::lock_guard<std::mutex> lock(g_colorMutex);
+        if (g_previewUiActive.load(std::memory_order_relaxed))
+            g_draftHsl[slot] = h;
+        else
+            g_slotHsl[slot] = h;
+    }
+
+    void ReadLocalSlotHsl(int slot, SlotHsl& out)
+    {
+        out = {};
+        if (slot < 0 || slot >= kMaxEquipSlots)
+            return;
+        std::lock_guard<std::mutex> lock(g_colorMutex);
+        if (g_previewUiActive.load(std::memory_order_relaxed)
+            && g_draftHsl[slot].active)
+            out = g_draftHsl[slot];
+        else
+            out = g_slotHsl[slot];
+    }
+
+    void SaveLocalHslIfCommitted()
+    {
+        if (!g_previewUiActive.load(std::memory_order_relaxed))
+            SaveHslToDisk();
+    }
+
+    // Transmog tints tab: preview-only draft until WXL_RecolorApplyDraft.
+    void SetSlotDraftSolid(int slot, float r, float g, float b)
+    {
+        if (slot < 0 || slot >= kMaxEquipSlots)
+            return;
+        SlotHsl h{};
+        h.active = true;
+        h.mode = 0;
+        h.stopCount = 1;
+        h.gradFill = 0;
+        h.hue = Clamp01(r);
+        h.sat = Clamp01(g);
+        h.light = Clamp01(b);
+        h.stops[0][0] = h.hue;
+        h.stops[0][1] = h.sat;
+        h.stops[0][2] = h.light;
+        {
+            std::lock_guard<std::mutex> lock(g_colorMutex);
+            g_draftHsl[slot] = h;
+        }
+    }
+
+    void SetSlotDraftGradient(int slot, int nStops, int fill, const float* colors, int colorFloats)
+    {
+        if (slot < 0 || slot >= kMaxEquipSlots || !colors)
+            return;
+        if (nStops != 2 && nStops != 3 && nStops != 5)
+            nStops = 3;
+        SlotHsl h{};
+        h.active = true;
+        h.mode = 2;
+        h.stopCount = static_cast<uint8_t>(nStops);
+        h.gradFill = (fill != 0) ? 1 : 0;
+        if (h.gradFill == 0)
+        {
+            if (colorFloats < 3)
+                return;
+            h.hue = Clamp01(colors[0]);
+            h.sat = Clamp01(colors[1]);
+            h.light = Clamp01(colors[2]);
+        }
+        else
+        {
+            if (colorFloats < nStops * 3)
+                return;
+            for (int s = 0; s < nStops; ++s)
+            {
+                h.stops[s][0] = Clamp01(colors[s * 3 + 0]);
+                h.stops[s][1] = Clamp01(colors[s * 3 + 1]);
+                h.stops[s][2] = Clamp01(colors[s * 3 + 2]);
+            }
+        }
+        ResolveSolidStops(h);
+        {
+            std::lock_guard<std::mutex> lock(g_colorMutex);
+            g_draftHsl[slot] = h;
+        }
+    }
+
+    void SetSlotDraftSelective(int slot, const SelRule* rules, int ruleCount)
+    {
+        if (slot < 0 || slot >= kMaxEquipSlots)
+            return;
+        if (!rules || ruleCount <= 0)
+        {
+            ClearDraftSlot(slot);
+            return;
+        }
+        SlotHsl h{};
+        h.active = true;
+        h.mode = 1;
+        const int n = (std::min)(ruleCount, kMaxSelRules);
+        h.ruleCount = static_cast<uint8_t>(n);
+        for (int i = 0; i < n; ++i)
+        {
+            SelRule r = rules[i];
+            r.sr = Clamp01(r.sr);
+            r.sg = Clamp01(r.sg);
+            r.sb = Clamp01(r.sb);
+            r.dr = Clamp01(r.dr);
+            r.dg = Clamp01(r.dg);
+            r.db = Clamp01(r.db);
+            r.tol = Clamp01(r.tol);
+            if (r.tol < 0.02f)
+                r.tol = 0.35f;
+            h.rules[i] = r;
+        }
+        SyncSlotMirrorsFromLastRule(h);
+        {
+            std::lock_guard<std::mutex> lock(g_colorMutex);
+            g_draftHsl[slot] = h;
+        }
+    }
+
+    bool IsBodyEquipSlot(int slot);
+    void RequestBodyRebuildForSlot(int slot);
+
+    void ApplySlotDraft(int slot)
+    {
+        if (slot < 0 || slot >= kMaxEquipSlots)
+            return;
+        SlotHsl h{};
+        {
+            std::lock_guard<std::mutex> lock(g_colorMutex);
+            if (!g_draftHsl[slot].active)
+                return;
+            h = g_draftHsl[slot];
+            g_slotHsl[slot] = h;
+            g_draftHsl[slot] = {};
+        }
+        if (IsBodyEquipSlot(slot))
+            RequestBodyRebuildForSlot(slot);
+        SaveHslToDisk();
+    }
+
     bool TrySlotHsl(int slot, SlotHsl& out)
     {
         if (slot < 0 || slot >= kMaxEquipSlots)
             return false;
         std::lock_guard<std::mutex> lock(g_colorMutex);
-        // g_hslPreferDraft is set by preview OC draw / preview CharComponent paste.
-        if (g_hslPreferDraft.load(std::memory_order_relaxed) && g_draftHsl[slot].active)
+        if (g_draftHsl[slot].active)
         {
             out = g_draftHsl[slot];
             return true;
@@ -801,18 +1523,63 @@ namespace
         return true;
     }
 
-    bool AnyDraftActive()
+    // Server SET payload — draft wins while /recolor is open (Apply sends UI state).
+    bool TrySlotHslCommittedOrDraft(int slot, SlotHsl& out)
     {
-        std::lock_guard<std::mutex> lock(g_colorMutex);
-        for (int i = 0; i < kMaxEquipSlots; ++i)
+        return TrySlotHsl(slot, out);
+    }
+
+    bool TrySlotHslForOwner(OwnerGuid owner, int slot, SlotHsl& out)
+    {
+        if (slot < 0 || slot >= kMaxEquipSlots)
+            return false;
+        const OwnerGuid local = ActiveOwnerGuid();
+        // STRICT: local table only for the local player. owner==0 must NOT fall through
+        // to g_slotHsl while in world — that leaked local helm tint onto other PCs.
+        if (local != 0)
         {
-            if (g_draftHsl[i].active)
+            if (GuidSamePlayer(owner, local))
+                return TrySlotHsl(slot, out);
+            // Remote (or unknown non-self): only remote map.
+            std::lock_guard<std::mutex> lock(g_remoteMu);
+            auto it = g_remoteTints.find(owner);
+            if (it == g_remoteTints.end())
+            {
+                // PUSH / UnitGUID may disagree on high bits — match low 32.
+                for (const auto& kv : g_remoteTints)
+                {
+                    if (GuidSamePlayer(kv.first, owner))
+                    {
+                        const SlotHsl& h = kv.second[static_cast<size_t>(slot)];
+                        if (!h.active)
+                            return false;
+                        out = h;
+                        return true;
+                    }
+                }
+                return false;
+            }
+            const SlotHsl& h = it->second[static_cast<size_t>(slot)];
+            if (!h.active)
+                return false;
+            out = h;
+            return true;
+        }
+        return false;
+    }
+
+    bool AnyRemoteTintActive()
+    {
+        std::lock_guard<std::mutex> lock(g_remoteMu);
+        for (const auto& kv : g_remoteTints)
+        {
+            if (OwnerHasAnyTintLocked(kv.second))
                 return true;
         }
         return false;
     }
 
-    bool TryHslForPath(const char* stem, SlotHsl& out, int* outSlot = nullptr)
+    bool TryHslForPathOwner(OwnerGuid owner, const char* stem, SlotHsl& out, int* outSlot = nullptr)
     {
         int cands[4] = { -1, -1, -1, -1 };
         const int nc = CandidateSlotsForOcPath(stem, cands, 4);
@@ -820,7 +1587,7 @@ namespace
             return false;
         for (int i = 0; i < nc; ++i)
         {
-            if (TrySlotHsl(cands[i], out))
+            if (TrySlotHslForOwner(owner, cands[i], out))
             {
                 if (outSlot)
                     *outSlot = cands[i];
@@ -830,83 +1597,32 @@ namespace
         return false;
     }
 
-    // --- Player / preview scoping (tint must NOT leak to other units) ---
+
+    // --- In-world player scoping (no glue / paperdoll / DressUp clones) ---
+
+    // OC live tint only during the world draw pass. Character panel (C), DressUp,
+    // and other UI ModelFrames render AFTER OnWorldRenderEnd — must not get g_slotHsl.
+    std::atomic<bool> g_ocWorldPass{ true };
 
     std::atomic<void*> g_localPlayerModel{ nullptr };
-    std::atomic<void*> g_previewModel{ nullptr };
     std::atomic<void*> g_localPlayerComponent{ nullptr };
-    std::atomic<void*> g_previewComponent{ nullptr };
-    std::atomic<bool> g_previewUiActive{ false };
     std::atomic<bool> g_pendingEnterWorldRebuild{ true };
-    std::atomic<bool> g_insideForcedRebuild{ false };
     std::atomic<int> g_rebuildBatchDepth{ 0 };
     std::atomic<uint32_t> g_deferredFullRebuildAt{ 0 };
-    // Natural paste tints since last ClearPlayerScope (char-select / world assemble).
     std::atomic<uint32_t> g_naturalTintPastes{ 0 };
-    std::atomic<uint32_t> g_previewCaptureUntil{ 0 };
     std::atomic<bool> g_forceAllowPaste{ false };
     std::atomic<bool> g_assemblingAllowed{ false };
-    // Set for the duration of hkRenderPrep / forced rebuild — paste tint must
-    // only run when this matches the local player model (never other PCs).
+    std::atomic<OwnerGuid> g_forceOwnerGuid{ 0 };
     std::atomic<void*> g_prepModel{ nullptr };
-    std::atomic<uint32_t> g_prepReasonCode{ 0 }; // 0 deny, 1 player, 2 sticky, 3 other-allow
-    // Once we have matched unit->model == component.model, never use login optimism.
+    std::atomic<uint32_t> g_prepReasonCode{ 0 };
     std::atomic<bool> g_playerModelLocked{ false };
-    // Retail: section loop at 0x4EE0D0 does `test [edi+0x0C], (1<<section)`.
-    // (whoa +0x04 is wrong here — +0x04 is a list link; +0x08 is m_flags.)
     constexpr size_t kOffComponentSectionDirty = 0x0C;
-    // M2Instance+0x10 init flags (WXL M2.hpp); logged on UI root capture.
     constexpr size_t kOffInstInitFlags = 0x10;
 
     void* ComponentModel(void* component);
     bool AnySlotActive();
     bool ComponentIsNpc(void* component);
     void FlushTexTintState(const char* reason);
-    // Char-select one-shot dirty; reset on scope flush so logout→select re-dirties.
-    std::atomic<void*> g_charselectDirtyModel{ nullptr };
-
-    // Extra OC roots for paperdoll / char-select / DressUp clones (not world unit+0xB4).
-    constexpr int kMaxUiOcRoots = 12;
-    std::mutex g_uiRootMu;
-    void* g_uiOcRoots[kMaxUiOcRoots] = {};
-    int g_uiOcRootN = 0;
-    std::atomic<uint32_t> g_uiCaptureUntil{ 0 };
-    std::atomic<bool> g_characterUiActive{ false };
-    std::atomic<bool> g_pendingPreviewForce{ false };
-
-    void RegisterUiOcRoot(void* root)
-    {
-        if (!root)
-            return;
-        std::lock_guard<std::mutex> lock(g_uiRootMu);
-        for (int i = 0; i < g_uiOcRootN; ++i)
-        {
-            if (g_uiOcRoots[i] == root)
-                return;
-        }
-        if (g_uiOcRootN < kMaxUiOcRoots)
-            g_uiOcRoots[g_uiOcRootN++] = root;
-        else
-            g_uiOcRoots[0] = root;
-    }
-
-    void ClearUiOcRoots()
-    {
-        std::lock_guard<std::mutex> lock(g_uiRootMu);
-        g_uiOcRootN = 0;
-        for (int i = 0; i < kMaxUiOcRoots; ++i)
-            g_uiOcRoots[i] = nullptr;
-    }
-
-    bool IsUiCaptureArmed()
-    {
-        return GetTickCount() <= g_uiCaptureUntil.load(std::memory_order_relaxed);
-    }
-
-    void ArmUiCapture(uint32_t ms)
-    {
-        g_uiCaptureUntil.store(GetTickCount() + ms, std::memory_order_relaxed);
-    }
 
     using CharRenderPrepFn = int(__thiscall*)(void* component, int a2);
     CharRenderPrepFn g_origRenderPrep = nullptr;
@@ -941,98 +1657,15 @@ namespace
 
     void* LocalPlayerBodyModel()
     {
-        const unsigned long long guid = wxl::game::world::ActivePlayerGuid();
+        const unsigned long long guid = ActiveOwnerGuid();
         if (!guid)
             return nullptr;
         void* unit = wxl::game::world::ResolveObject(
             guid, wxl::game::world::kTypeMaskUnit | wxl::game::world::kTypeMaskPlayer);
         void* model = wxl::game::unit::Model(unit);
-        g_localPlayerModel.store(model, std::memory_order_relaxed);
+        if (model)
+            g_localPlayerModel.store(model, std::memory_order_relaxed);
         return model;
-    }
-
-    bool ModelInAllowedTree(void* instance)
-    {
-        if (!instance)
-            return false;
-
-        // World: prefer live local player model root. Never tint OC for units
-        // that merely share item paths (same helm/shoulder/weapon as you).
-        // Glue / char-select: ActivePlayerGuid is null — still allow the sticky
-        // CharacterComponent model so helm/shoulder/weapon tint on enter-world.
-        // (Body paste already uses sticky; OC used to miss it after world gate.)
-        void* playerModel = LocalPlayerBodyModel();
-
-        // Roots that may own ObjectComponents (helm/shoulder/weapon):
-        // unit+0xB4, sticky CharacterComponent.model, DressUp preview, and UI
-        // paperdoll / char-select clones captured into g_uiOcRoots.
-        void* roots[16] = {};
-        int n = 0;
-        auto addRoot = [&](void* p) {
-            if (!p || n >= 16)
-                return;
-            for (int i = 0; i < n; ++i)
-            {
-                if (roots[i] == p)
-                    return;
-            }
-            roots[n++] = p;
-        };
-        if (playerModel)
-        {
-            addRoot(playerModel);
-            addRoot(g_localPlayerModel.load(std::memory_order_relaxed));
-            addRoot(ComponentModel(g_localPlayerComponent.load(std::memory_order_relaxed)));
-        }
-        else
-        {
-            // Char-select / enter-world screen only (no world unit yet).
-            addRoot(g_localPlayerModel.load(std::memory_order_relaxed));
-            addRoot(ComponentModel(g_localPlayerComponent.load(std::memory_order_relaxed)));
-        }
-        addRoot(g_previewModel.load(std::memory_order_relaxed));
-        {
-            std::lock_guard<std::mutex> lock(g_uiRootMu);
-            for (int i = 0; i < g_uiOcRootN; ++i)
-                addRoot(g_uiOcRoots[i]);
-        }
-        if (n == 0)
-            return false;
-
-        void* cur = instance;
-        for (int depth = 0; depth < 24 && cur; ++depth)
-        {
-            for (int i = 0; i < n; ++i)
-            {
-                if (cur == roots[i])
-                    return true;
-            }
-            cur = wxl::game::unit::ModelParent(cur);
-        }
-        return false;
-    }
-
-    // Paperdoll / shallow UI clones: parent chain often ends at p0 with p1==null.
-    bool TryCaptureUiOcRoot(void* instance)
-    {
-        if (!instance)
-            return false;
-        const bool uiOpen = g_characterUiActive.load(std::memory_order_relaxed)
-            || g_previewUiActive.load(std::memory_order_relaxed)
-            || IsUiCaptureArmed();
-        if (!uiOpen)
-            return false;
-        void* p0 = wxl::game::unit::ModelParent(instance);
-        if (!p0)
-            return false;
-        // Only shallow UI trees (paperdoll / DressUp), not world unit graphs.
-        if (wxl::game::unit::ModelParent(p0) != nullptr)
-            return false;
-        void* player = LocalPlayerBodyModel();
-        if (player && p0 == player)
-            return false;
-        RegisterUiOcRoot(p0);
-        return true;
     }
 
     bool ComponentIsNpc(void* component)
@@ -1045,6 +1678,179 @@ namespace
         return SafeReadPtr(component, kOffComponentModel);
     }
 
+    bool ModelIsUnderRoot(void* instance, void* root)
+    {
+        if (!instance || !root)
+            return false;
+        void* cur = instance;
+        for (int depth = 0; depth < 24 && cur; ++depth)
+        {
+            if (cur == root)
+                return true;
+            cur = wxl::game::unit::ModelParent(cur);
+        }
+        return false;
+    }
+
+    bool BodyModelOwnerGuid(void* bodyModel, OwnerGuid& outGuid)
+    {
+        if (!bodyModel)
+            return false;
+        if (void* local = LocalPlayerBodyModel())
+        {
+            if (bodyModel == local)
+            {
+                outGuid = ActiveOwnerGuid();
+                return outGuid != 0;
+            }
+        }
+        std::vector<OwnerGuid> owners;
+        {
+            std::lock_guard<std::mutex> lock(g_remoteMu);
+            owners.reserve(g_remoteTints.size());
+            for (const auto& kv : g_remoteTints)
+            {
+                if (OwnerHasAnyTintLocked(kv.second))
+                    owners.push_back(kv.first);
+            }
+            for (const auto& kv : g_remotePendingDirty)
+            {
+                if (kv.second)
+                    owners.push_back(kv.first);
+            }
+            for (const auto& kv : g_remoteCcModels)
+            {
+                if (kv.second == bodyModel)
+                {
+                    outGuid = kv.first;
+                    return true;
+                }
+            }
+        }
+        for (OwnerGuid guid : owners)
+        {
+            void* unit = wxl::game::world::ResolveObject(
+                guid, wxl::game::world::kTypeMaskUnit | wxl::game::world::kTypeMaskPlayer);
+            void* root = wxl::game::unit::Model(unit);
+            if (root == bodyModel || (root && ModelIsUnderRoot(bodyModel, root)))
+            {
+                outGuid = guid;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Live unit body only (self + remote players). No remembered CC / UI clone roots —
+    // stale CC pointers were reusable by NPC/paperdoll parents and leaked slot tints.
+    bool ResolveModelTintOwner(void* instance, OwnerGuid& outOwner)
+    {
+        if (!instance)
+            return false;
+
+        const OwnerGuid self = ActiveOwnerGuid();
+
+        std::vector<OwnerGuid> owners;
+        {
+            std::lock_guard<std::mutex> lock(g_remoteMu);
+            owners.reserve(g_remoteTints.size());
+            for (const auto& kv : g_remoteTints)
+            {
+                if (OwnerHasAnyTintLocked(kv.second))
+                    owners.push_back(kv.first);
+            }
+        }
+        for (OwnerGuid guid : owners)
+        {
+            if (self != 0 && GuidSamePlayer(guid, self))
+                continue;
+            void* unit = wxl::game::world::ResolveObject(
+                guid, wxl::game::world::kTypeMaskUnit | wxl::game::world::kTypeMaskPlayer);
+            void* root = wxl::game::unit::Model(unit);
+            if (root && ModelIsUnderRoot(instance, root))
+            {
+                outOwner = guid;
+                return true;
+            }
+        }
+
+        if (self != 0)
+        {
+            void* pm = LocalPlayerBodyModel();
+            if (pm && ModelIsUnderRoot(instance, pm))
+            {
+                outOwner = self;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // CharModelObject → owner by sceneNode equality. Never pass CMO to BodyModelOwnerGuid
+    // or ModelIsUnderRoot — those expect M2 render contexts (AV on DressUp / paperdoll).
+    bool ResolveOwnerFromCmo(void* cmo, OwnerGuid& outOwner)
+    {
+        outOwner = 0;
+        if (!cmo)
+            return false;
+        void* scene = SafeReadPtr(cmo, wxl::offsets::game::m2::kOffCmoSceneNode);
+        if (!scene)
+            return false;
+
+        const OwnerGuid self = ActiveOwnerGuid();
+        if (self)
+        {
+            void* pm = LocalPlayerBodyModel();
+            if (pm && scene == pm)
+            {
+                outOwner = self;
+                return true;
+            }
+        }
+
+        std::vector<OwnerGuid> owners;
+        {
+            std::lock_guard<std::mutex> lock(g_remoteMu);
+            owners.reserve(g_remoteTints.size() + g_remotePendingDirty.size());
+            for (const auto& kv : g_remoteTints)
+            {
+                if (OwnerHasAnyTintLocked(kv.second))
+                    owners.push_back(kv.first);
+            }
+            for (const auto& kv : g_remotePendingDirty)
+            {
+                if (kv.second)
+                    owners.push_back(kv.first);
+            }
+        }
+        for (OwnerGuid guid : owners)
+        {
+            if (self && GuidSamePlayer(guid, self))
+                continue;
+            void* unit = wxl::game::world::ResolveObject(
+                guid, wxl::game::world::kTypeMaskUnit | wxl::game::world::kTypeMaskPlayer);
+            void* root = wxl::game::unit::Model(unit);
+            if (root && scene == root)
+            {
+                outOwner = guid;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void* OwnerBodyModel(OwnerGuid owner)
+    {
+        if (!owner)
+            return nullptr;
+        const OwnerGuid self = ActiveOwnerGuid();
+        if (self && GuidSamePlayer(owner, self))
+            return LocalPlayerBodyModel();
+        void* unit = wxl::game::world::ResolveObject(
+            owner, wxl::game::world::kTypeMaskUnit | wxl::game::world::kTypeMaskPlayer);
+        return wxl::game::unit::Model(unit);
+    }
+
     bool IsPasteTintAllowed()
     {
         const bool force = g_forceAllowPaste.load(std::memory_order_relaxed);
@@ -1052,40 +1858,45 @@ namespace
         if (!force && !assembling)
             return false;
 
-        // Hard world gate: even if sticky/optimism wrongly allowed another unit's
-        // CharComponent, never mutate TextureCache for non-local assemblies.
-        void* pm = LocalPlayerBodyModel();
         void* prep = g_prepModel.load(std::memory_order_relaxed);
-        void* previewModel = g_previewModel.load(std::memory_order_relaxed);
-        if (!pm)
-            return true;
         if (!prep)
             return false;
-        if (prep == pm)
+
+        const OwnerGuid prepOwner = g_prepOwnerGuid.load(std::memory_order_relaxed);
+        const OwnerGuid self = ActiveOwnerGuid();
+        if (!prepOwner)
+            return false;
+
+        const OwnerGuid forceOwn = g_forceOwnerGuid.load(std::memory_order_relaxed);
+        const bool forceMatch = force && forceOwn != 0
+            && GuidSamePlayer(forceOwn, prepOwner);
+        if (!forceMatch)
+        {
+            void* ownerModel = OwnerBodyModel(prepOwner);
+            if (!ownerModel || prep != ownerModel)
+                return false;
+        }
+        if (self && GuidSamePlayer(prepOwner, self))
             return true;
-        // DressUp / transmog preview rebuild while world player exists.
-        if (previewModel && prep == previewModel
-            && g_previewUiActive.load(std::memory_order_relaxed))
-            return true;
-        return false;
+        return OwnerHasAnyRemoteTint(prepOwner) || forceMatch;
     }
 
     void ClearPlayerScope()
     {
         g_localPlayerComponent.store(nullptr, std::memory_order_relaxed);
         g_localPlayerModel.store(nullptr, std::memory_order_relaxed);
-        g_previewComponent.store(nullptr, std::memory_order_relaxed);
-        g_previewModel.store(nullptr, std::memory_order_relaxed);
         g_playerModelLocked.store(false, std::memory_order_relaxed);
-        g_previewCaptureUntil.store(0, std::memory_order_relaxed);
-        g_pendingPreviewForce.store(false, std::memory_order_relaxed);
-        // World re-entry: prefer natural paste tint (char-select quality), not Force.
         g_pendingEnterWorldRebuild.store(true, std::memory_order_relaxed);
         g_naturalTintPastes.store(0, std::memory_order_relaxed);
         g_deferredFullRebuildAt.store(0, std::memory_order_relaxed);
-        ClearUiOcRoots();
-        // Logout/relog: TextureCache pointers are freed and reused. Stale g_texTint
-        // "orig" + live pastes corrupt the next char-select until client restart.
+        {
+            std::lock_guard<std::mutex> lock(g_colorMutex);
+            for (int i = 0; i < kMaxEquipSlots; ++i)
+            {
+                g_slotHsl[static_cast<size_t>(i)] = {};
+                g_draftHsl[static_cast<size_t>(i)] = {};
+            }
+        }
         FlushTexTintState("clear_scope");
     }
 
@@ -1100,8 +1911,8 @@ namespace
     {
         switch (slot)
         {
-        case 3: case 4: // shirt / chest → torso upper+lower
-            return (1u << 3) | (1u << 4);
+        case 3: case 4: // shirt / chest — torso + sleeves/bracers from same item
+            return (1u << 0) | (1u << 1) | (1u << 3) | (1u << 4);
         case 5: // waist / belt lives on leg-upper
             return (1u << 5);
         case 6: // legs
@@ -1119,138 +1930,686 @@ namespace
         }
     }
 
-    bool ComponentBelongsToLocalPlayer(void* component)
+    bool PeekRemotePendingDirty(OwnerGuid owner)
     {
-        if (!component)
-            return false;
-        void* playerModel = LocalPlayerBodyModel();
-        if (!playerModel)
-            return false;
-        void* cm = ComponentModel(component);
-        return cm && cm == playerModel;
-    }
-
-    void ArmPreviewCapture(uint32_t ms)
-    {
-        const uint32_t now = GetTickCount();
-        g_previewCaptureUntil.store(now + ms, std::memory_order_relaxed);
-        g_previewUiActive.store(true, std::memory_order_relaxed);
-    }
-
-    void ForceComponentRebuild(void* component, uint32_t sectionMask)
-    {
-        if (!component || !g_origRenderPrep || sectionMask == 0)
-            return;
-        // Stale pointer after logout/relog → native RenderPrep crashes.
-        // Char-select has no ActivePlayerGuid — allow sticky local / preview.
-        const bool isPreview = (component == g_previewComponent.load(std::memory_order_relaxed));
-        const bool isStickyLocal = (component == g_localPlayerComponent.load(std::memory_order_relaxed));
-        if (!ComponentBelongsToLocalPlayer(component) && !isPreview && !isStickyLocal)
+        std::lock_guard<std::mutex> lock(g_remoteMu);
+        for (const auto& kv : g_remotePendingDirty)
         {
-            return;
+            if (kv.second && GuidSamePlayer(kv.first, owner))
+                return true;
         }
-        // Preview component may outlive its model after DressUp teardown, or Dress
-        // may replace the model pointer — refresh sticky instead of wiping preview.
-        if (component == g_previewComponent.load(std::memory_order_relaxed))
+        return false;
+    }
+
+    uint32_t TakeRemotePendingMask(OwnerGuid owner)
+    {
+        std::lock_guard<std::mutex> lock(g_remoteMu);
+        for (auto it = g_remotePendingDirty.begin(); it != g_remotePendingDirty.end(); ++it)
         {
-            void* cm = ComponentModel(component);
-            if (!cm)
+            if (!GuidSamePlayer(it->first, owner))
+                continue;
+            const uint32_t mask = it->second;
+            g_remotePendingDirty.erase(it);
+            return mask;
+        }
+        return 0;
+    }
+
+    void ClearRemotePendingDirty(OwnerGuid owner)
+    {
+        std::lock_guard<std::mutex> lock(g_remoteMu);
+        for (auto it = g_remotePendingDirty.begin(); it != g_remotePendingDirty.end(); )
+        {
+            if (GuidSamePlayer(it->first, owner))
+                it = g_remotePendingDirty.erase(it);
+            else
+                ++it;
+        }
+    }
+
+    void OrRemotePendingMask(OwnerGuid owner, uint32_t sectionMask)
+    {
+        if (!owner || sectionMask == 0)
+            return;
+        std::lock_guard<std::mutex> lock(g_remoteMu);
+        for (auto& kv : g_remotePendingDirty)
+        {
+            if (GuidSamePlayer(kv.first, owner))
             {
-                g_previewComponent.store(nullptr, std::memory_order_relaxed);
-                g_previewModel.store(nullptr, std::memory_order_relaxed);
+                kv.second |= sectionMask;
                 return;
             }
-            g_previewModel.store(cm, std::memory_order_relaxed);
         }
-        uint32_t dirtyBefore = 0;
+        g_remotePendingDirty[owner] |= sectionMask;
+    }
+
+    void RememberRemoteCc(OwnerGuid owner, void* component, void* model)
+    {
+        if (!owner || (!component && !model))
+            return;
+        std::lock_guard<std::mutex> lock(g_remoteMu);
+        if (model)
+            g_remoteCcModels[owner] = model;
+        if (component)
+            g_remoteCcComponents[owner] = component;
+    }
+
+    void RememberModelComponent(void* model, void* component)
+    {
+        if (!model || !component)
+            return;
+        std::lock_guard<std::mutex> lock(g_remoteMu);
+        g_modelToComponent[model] = component;
+    }
+
+    void* LookupComponentForModel(void* model)
+    {
+        if (!model)
+            return nullptr;
+        std::lock_guard<std::mutex> lock(g_remoteMu);
+        auto it = g_modelToComponent.find(model);
+        return it != g_modelToComponent.end() ? it->second : nullptr;
+    }
+
+    void SetComponentSectionDirtySeh(void* component, uint32_t sectionMask) noexcept
+    {
+        if (!component || sectionMask == 0)
+            return;
         __try
         {
-            // GOOD PATH (keep): dirty section bits @ +0x0C then RenderPrep(a2=1).
-            // Use a per-slot mask — dirtying 0xFFFFFFFF re-pasted every body piece and
-            // caused cross-slot texture influence.
-            dirtyBefore = *reinterpret_cast<uint32_t*>(
-                static_cast<uint8_t*>(component) + kOffComponentSectionDirty);
+            *reinterpret_cast<uint32_t*>(
+                static_cast<uint8_t*>(component) + kOffComponentSectionDirty)
+                |= sectionMask;
+            *reinterpret_cast<uint32_t*>(
+                static_cast<uint8_t*>(component) + 0x08) |= 0x1u;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+    }
+
+    void DirtyComponentSections(void* component, uint32_t sectionMask)
+    {
+        // NEVER use full-body 0x3FF — that re-pastes every section and corrupts
+        // composites. Callers must pass only the slot's section bits.
+        if (!sectionMask)
+            return;
+        SetComponentSectionDirtySeh(component, sectionMask);
+    }
+
+    uint32_t ActiveRemoteSectionMask(OwnerGuid owner)
+    {
+        uint32_t mask = 0;
+        std::lock_guard<std::mutex> lock(g_remoteMu);
+        auto it = g_remoteTints.find(owner);
+        if (it != g_remoteTints.end())
+        {
+            for (int s = 0; s < kMaxEquipSlots; ++s)
+            {
+                if (it->second[static_cast<size_t>(s)].active)
+                    mask |= SectionMaskForEquipSlot(s);
+            }
+        }
+        return mask;
+    }
+
+    int CallOrigRenderPrepSeh(void* component, int a2) noexcept
+    {
+        if (!component || !g_origRenderPrep)
+            return 0;
+        __try
+        {
+            return g_origRenderPrep(component, a2);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return -1;
+        }
+    }
+
+    // Verified CharComponent for a player: component.model must equal unit+0xB4.
+    void* FindVerifiedOwnerComponent(OwnerGuid owner, void** outModel = nullptr)
+    {
+        if (!owner)
+            return nullptr;
+        void* unit = wxl::game::world::ResolveObject(
+            owner, wxl::game::world::kTypeMaskUnit | wxl::game::world::kTypeMaskPlayer);
+        void* unitModel = wxl::game::unit::Model(unit);
+        if (!unitModel)
+            return nullptr;
+        if (outModel)
+            *outModel = unitModel;
+
+        void* remembered = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_remoteMu);
+            auto it = g_remoteCcComponents.find(owner);
+            if (it != g_remoteCcComponents.end())
+                remembered = it->second;
+        }
+        if (remembered && ComponentModel(remembered) == unitModel)
+            return remembered;
+
+        void* mapped = LookupComponentForModel(unitModel);
+        if (mapped && ComponentModel(mapped) == unitModel)
+            return mapped;
+        return nullptr;
+    }
+
+
+    // Identical rebuild for self and remote (the path that already works on the
+    // local player). forceAllowPaste + restore-after-paste is safe per-component
+    // because paste hooks always RestoreTextureCacheOrig.
+    void ScheduleOwnerSectionRebuild(OwnerGuid owner, uint32_t sectionMask); // fwd
+    int SetComponentSectionDirtyReplaceSeh(void* component, uint32_t sectionMask) noexcept; // fwd
+    void ForceOwnerBodyRebuild(OwnerGuid owner, uint32_t sectionMask); // fwd
+    void ForceOwnerPerSlotMasks(OwnerGuid owner, uint32_t sectionMask); // fwd
+    void ScheduleDeferredRemoteClear(OwnerGuid owner, uint32_t sectionMask); // fwd
+    void CancelDeferredRemoteClear(OwnerGuid owner, uint32_t sectionMask); // fwd
+    void FlushDeferredRemoteClears(); // fwd
+
+    void* FindOwnerCharComponent(OwnerGuid owner, void** outModel)
+    {
+        if (!owner)
+            return nullptr;
+        const OwnerGuid self = ActiveOwnerGuid();
+        if (self && GuidSamePlayer(owner, self))
+        {
+            void* pm = LocalPlayerBodyModel();
+            void* local = g_localPlayerComponent.load(std::memory_order_relaxed);
+            if (pm && local && ComponentModel(local) == pm)
+            {
+                if (outModel)
+                    *outModel = pm;
+                return local;
+            }
+            if (pm)
+            {
+                void* mapped = LookupComponentForModel(pm);
+                if (mapped && ComponentModel(mapped) == pm)
+                {
+                    if (outModel)
+                        *outModel = pm;
+                    return mapped;
+                }
+            }
+            // No glue / char-select sticky — in-world body only.
+            return nullptr;
+        }
+        return FindVerifiedOwnerComponent(owner, outModel);
+    }
+
+    // #region agent log — runtime RE probe (no tint behavior change)
+    constexpr uintptr_t kWowLocalCharComponent = 0x00B6B1A0;
+    constexpr uintptr_t kWowCharComponentPool = 0x00B6B240;
+    constexpr size_t kWowCharComponentStride = 0x198;
+
+    void ReProbeLog615(const char* message, void* component, void* model, int a2,
+        uint32_t flags, const char* reason, int allowed, OwnerGuid owner,
+        void* unitRoot, int modelEqRoot, int underRoot, int verifiedComp,
+        int pasteStrictOk, int isSingleton, int poolIndex)
+    {
+        static std::atomic<int> s_n{ 0 };
+        if (s_n.fetch_add(1, std::memory_order_relaxed) >= 500)
+            return;
+        FILE* f = nullptr;
+        if (fopen_s(&f, kDbgLog615, "a") != 0 || !f)
+            return;
+        const unsigned long long ts = static_cast<unsigned long long>(GetTickCount64());
+        fprintf(f,
+            "{\"sessionId\":\"615e3b\",\"runId\":\"no-remote-force\",\"hypothesisId\":\"RE\","
+            "\"location\":\"hkRenderPrep\",\"message\":\"%s\",\"timestamp\":%llu,"
+            "\"data\":{\"reason\":\"%s\",\"allowed\":%d,\"a2\":%d,\"flags\":%u,"
+            "\"comp\":%llu,\"model\":%llu,\"unitRoot\":%llu,"
+            "\"ownerLow\":%u,\"modelEqRoot\":%d,\"underRoot\":%d,"
+            "\"verifiedComp\":%d,\"pasteStrictOk\":%d,"
+            "\"isSingleton\":%d,\"poolIndex\":%d}}\n",
+            message, ts, reason ? reason : "", allowed, a2, flags,
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(component)),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(model)),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(unitRoot)),
+            static_cast<unsigned>(owner & 0xFFFFFFFFull),
+            modelEqRoot, underRoot, verifiedComp, pasteStrictOk,
+            isSingleton, poolIndex);
+        fclose(f);
+    }
+
+    int CharComponentPoolIndex(void* component)
+    {
+        if (!component)
+            return -1;
+        void* pool = nullptr;
+        __try { pool = *reinterpret_cast<void**>(kWowCharComponentPool); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+        if (!pool)
+            return -1;
+        const uintptr_t base = reinterpret_cast<uintptr_t>(pool);
+        const uintptr_t cur = reinterpret_cast<uintptr_t>(component);
+        if (cur < base)
+            return -1;
+        const uintptr_t delta = cur - base;
+        if (delta % kWowCharComponentStride != 0)
+            return -1;
+        return static_cast<int>(delta / kWowCharComponentStride);
+    }
+
+    void ReProbeRenderPrep(void* component, void* model, int a2, bool isNpc,
+        const char* reason, bool allowed, OwnerGuid self, void* playerModel)
+    {
+        if (isNpc || !component || !model)
+            return;
+
+        OwnerGuid owner = 0;
+        void* unitRoot = nullptr;
+        const int isLocal = (playerModel && model == playerModel) ? 1 : 0;
+        if (isLocal)
+        {
+            owner = self;
+            unitRoot = playerModel;
+        }
+        else if (!BodyModelOwnerGuid(model, owner))
+            return;
+
+        if (!unitRoot)
+            unitRoot = OwnerBodyModel(owner);
+        if (!unitRoot)
+            return;
+
+        const int hasRemoteTint = OwnerHasAnyRemoteTint(owner) ? 1 : 0;
+        if (!isLocal && !hasRemoteTint && !allowed)
+            return;
+
+        static std::atomic<uint32_t> s_localSample{ 0 };
+        if (isLocal && !hasRemoteTint)
+        {
+            if ((s_localSample.fetch_add(1, std::memory_order_relaxed) % 40) != 0)
+                return;
+        }
+
+        void* singleton = nullptr;
+        __try { singleton = *reinterpret_cast<void**>(kWowLocalCharComponent); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { singleton = nullptr; }
+        const int isSingleton = (singleton && component == singleton) ? 1 : 0;
+        const int poolIndex = CharComponentPoolIndex(component);
+
+        const uint32_t flags = SafeReadU32(component, kOffComponentFlags);
+        const int modelEqRoot = (model == unitRoot) ? 1 : 0;
+        const int underRoot = ModelIsUnderRoot(model, unitRoot) ? 1 : 0;
+        void* verifiedModel = nullptr;
+        void* verified = FindVerifiedOwnerComponent(owner, &verifiedModel);
+        const int verifiedComp = verified ? 1 : 0;
+        const char* tag = isLocal ? "self" : "remote";
+        if (!allowed && hasRemoteTint)
+            tag = "remote_miss";
+        ReProbeLog615(tag, component, model, a2, flags, reason,
+            allowed ? 1 : 0, owner, unitRoot, modelEqRoot, underRoot,
+            verifiedComp, modelEqRoot, isSingleton, poolIndex);
+    }
+    // #endregion
+
+    void DirtyOwnerSections(OwnerGuid owner, uint32_t sectionMask)
+    {
+        if (!owner || sectionMask == 0)
+            return;
+        const OwnerGuid self = ActiveOwnerGuid();
+        if (self && GuidSamePlayer(owner, self))
+            ScheduleOwnerSectionRebuild(owner, sectionMask);
+        else
+            OrRemotePendingMask(owner, sectionMask);
+    }
+
+    // Unified write: self → g_slotHsl, other → g_remoteTints, then DirtyOwnerSections.
+    bool ApplyOwnerTint(OwnerGuid owner, int slot, const SlotHsl* hslOrNull)
+    {
+        if (!owner || slot < 0 || slot >= kMaxEquipSlots)
+            return false;
+        const OwnerGuid self = ActiveOwnerGuid();
+        const bool isSelf = self && GuidSamePlayer(owner, self);
+        if (isSelf)
+        {
+            if (!hslOrNull)
+            {
+                {
+                    std::lock_guard<std::mutex> lock(g_colorMutex);
+                    g_slotHsl[slot] = {};
+                    g_draftHsl[slot] = {};
+                }
+                SaveHslToDisk();
+            }
+            else
+            {
+                {
+                    std::lock_guard<std::mutex> lock(g_colorMutex);
+                    g_slotHsl[slot] = *hslOrNull;
+                    g_draftHsl[slot] = {};
+                }
+                SaveHslToDisk();
+            }
+            const uint32_t mask = SectionMaskForEquipSlot(slot);
+            if (mask)
+                DirtyOwnerSections(self, mask);
+            return true;
+        }
+        if (!hslOrNull)
+        {
+            ClearRemoteSlotTint(owner, slot);
+            const uint32_t mask = SectionMaskForEquipSlot(slot);
+            // Defer Force: transmog visible-slot PUSH clear is often followed by
+            // SET within the same tick — immediate Force pasted untinted feet
+            // (logs: feet_paste empty/hasHsl:0) and wiped neighbours.
+            if (mask)
+                ScheduleDeferredRemoteClear(owner, mask);
+            // Do NOT zero equip snap here — SET's NoteEquip refreshes entry.
+            // Zeroing made empty:1 gate / diagnostics lie during the CLEAR window.
+            // Head/shoulder/weapon (mask 0): OC path. NEVER fall back to
+            // ActiveRemoteSectionMask — that Forced remotes with mask=255 and wiped
+            // their composites (logs Asf L853/871/887 after weapon/helm unequip).
+            return true;
+        }
+
+        // PUSH SET can arrive before equip snap if a transmog CLEAR storm zeroed
+        // it — store tint and retry via pending mask instead of dropping.
+        if (EquipSnapEntry(owner, slot) == 0)
+        {
+            SetRemoteSlotTint(owner, slot, *hslOrNull);
+            const uint32_t mask = SectionMaskForEquipSlot(slot);
+            if (mask)
+                OrRemotePendingMask(owner, mask);
+            return true;
+        }
+
+        // Skip Force when remote already has the identical HSL — transmog UI
+        // re-PUSH SET storms were wiping composites (force_rebuild x300+).
+        SlotHsl prev{};
+        const bool hadPrev = TrySlotHslForOwner(owner, slot, prev);
+        char prevData[384] = {};
+        char nextData[384] = {};
+        const bool same = hadPrev && prev.active && hslOrNull->active
+            && prev.mode == hslOrNull->mode
+            && FormatTintData(prev, prevData, sizeof(prevData))
+            && FormatTintData(*hslOrNull, nextData, sizeof(nextData))
+            && std::strcmp(prevData, nextData) == 0;
+        SetRemoteSlotTint(owner, slot, *hslOrNull);
+        const uint32_t mask = SectionMaskForEquipSlot(slot);
+        if (mask)
+            CancelDeferredRemoteClear(owner, mask);
+        if (!same && mask)
+            DirtyOwnerSections(owner, mask);
+
+        // #region agent log
+        if (g_dbgApplyRemoteN.fetch_add(1, std::memory_order_relaxed) < 40)
+        {
+            DbgLog615("H3", "ApplyOwnerTint", "remote_set",
+                static_cast<unsigned long long>(owner), slot, static_cast<int>(mask),
+                "", static_cast<int>(hslOrNull->mode), EquipSnapEntry(owner, slot),
+                mask);
+        }
+        // #endregion
+        return true;
+    }
+
+
+    int SetComponentSectionDirtyReplaceSeh(void* component, uint32_t sectionMask) noexcept
+    {
+        if (!component || sectionMask == 0)
+            return -1;
+        __try
+        {
             *reinterpret_cast<uint32_t*>(
                 static_cast<uint8_t*>(component) + kOffComponentSectionDirty) = sectionMask;
-            *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(component) + 0x08) |= 0x1u;
+            *reinterpret_cast<uint32_t*>(
+                static_cast<uint8_t*>(component) + 0x08) |= 0x1u;
+            return 0;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
+            return -1;
+        }
+    }
+
+    // Never Force a mega-mask (255 / multi-slot OR) — re-pastes whole composite.
+    void ForceOwnerPerSlotMasks(OwnerGuid owner, uint32_t sectionMask)
+    {
+        if (!owner || sectionMask == 0)
+            return;
+        bool any = false;
+        for (int s = 0; s < kMaxEquipSlots; ++s)
+        {
+            const uint32_t m = SectionMaskForEquipSlot(s);
+            if (!m || (sectionMask & m) == 0)
+                continue;
+            ForceOwnerBodyRebuild(owner, m);
+            any = true;
+        }
+        if (!any)
+            ForceOwnerBodyRebuild(owner, sectionMask);
+    }
+
+    void ForceOwnerBodyRebuild(OwnerGuid owner, uint32_t sectionMask)
+    {
+        if (!owner || sectionMask == 0 || !g_origRenderPrep)
+            return;
+        void* unitModel = nullptr;
+        void* component = FindOwnerCharComponent(owner, &unitModel);
+        if (!component || !unitModel)
+        {
+            const OwnerGuid self = ActiveOwnerGuid();
+            if (!(self && GuidSamePlayer(owner, self)))
+                OrRemotePendingMask(owner, sectionMask);
             return;
         }
+        const OwnerGuid self = ActiveOwnerGuid();
+        if (!(self && GuidSamePlayer(owner, self)))
+            RememberRemoteCc(owner, component, unitModel);
+
+        if (SetComponentSectionDirtyReplaceSeh(component, sectionMask) < 0)
+            return;
+
+        // Identical to the local-player force path that already works.
         g_forceAllowPaste.store(true, std::memory_order_relaxed);
-        void* prepNow = ComponentModel(component);
-        g_prepModel.store(prepNow, std::memory_order_relaxed);
-        // Preview rebuilds must resolve draft HSL (paperdoll-only until Apply).
-        g_hslPreferDraft.store(isPreview, std::memory_order_relaxed);
-        __try
-        {
-            g_origRenderPrep(component, 1);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            ClearPlayerScope();
-        }
-        // Always drop force-allow — a stuck true tints every subsequent paste
-        // (other players / skin overlays sharing TextureCache).
+        g_assemblingAllowed.store(true, std::memory_order_relaxed);
+        g_prepModel.store(unitModel, std::memory_order_relaxed);
+        g_prepOwnerGuid.store(owner, std::memory_order_relaxed);
+        g_forceOwnerGuid.store(owner, std::memory_order_relaxed);
+        CallOrigRenderPrepSeh(component, 1);
         g_forceAllowPaste.store(false, std::memory_order_relaxed);
         g_assemblingAllowed.store(false, std::memory_order_relaxed);
         g_prepModel.store(nullptr, std::memory_order_relaxed);
-        g_hslPreferDraft.store(false, std::memory_order_relaxed);
+        g_prepOwnerGuid.store(0, std::memory_order_relaxed);
+        g_forceOwnerGuid.store(0, std::memory_order_relaxed);
+        ClearRemotePendingDirty(owner);
+
+        // #region agent log
+        {
+            const OwnerGuid self = ActiveOwnerGuid();
+            const bool isRemote = self != 0 && !GuidSamePlayer(owner, self);
+            if (isRemote && g_dbgForceRebuildN.fetch_add(1, std::memory_order_relaxed) < 40)
+            {
+                DbgLog615("H3", "ForceOwnerBodyRebuild", "done",
+                    static_cast<unsigned long long>(owner), -1,
+                    static_cast<int>(sectionMask), "", static_cast<int>(sectionMask), 0, 0);
+            }
+        }
+        // #endregion
+        // Do NOT RescheduleAllRemoteTints here. Logs (Asf L722/741/760): after every
+        // self rebuild we ForceOwnerBodyRebuild(remote, mask=255) which wiped shaman
+        // composites on the pala client ("To all" / equip feet → shaman tints vanish
+        // or feet pick up a new colour) while g_remoteTints data stayed intact.
+    }
+
+    std::mutex g_ownerCoalesceMu;
+    std::unordered_map<OwnerGuid, uint32_t> g_ownerCoalesceMask;
+    std::atomic<uint32_t> g_ownerCoalesceDue{ 0 };
+
+    // Remote PUSH clear from transmog visible-slot flicker: defer Force so a
+    // following SET cancels the wipe (logs: CLEAR→feet_paste hasHsl:0→SET).
+    std::mutex g_remoteClearMu;
+    std::unordered_map<OwnerGuid, uint32_t> g_remoteDeferredClearMask;
+    std::atomic<uint32_t> g_remoteClearDue{ 0 };
+
+    void CancelDeferredRemoteClear(OwnerGuid owner, uint32_t sectionMask)
+    {
+        if (!owner || !sectionMask)
+            return;
+        std::lock_guard<std::mutex> lock(g_remoteClearMu);
+        for (auto it = g_remoteDeferredClearMask.begin(); it != g_remoteDeferredClearMask.end(); )
+        {
+            if (!GuidSamePlayer(it->first, owner))
+            {
+                ++it;
+                continue;
+            }
+            it->second &= ~sectionMask;
+            if (!it->second)
+                it = g_remoteDeferredClearMask.erase(it);
+            else
+                ++it;
+        }
+    }
+
+    void ScheduleDeferredRemoteClear(OwnerGuid owner, uint32_t sectionMask)
+    {
+        if (!owner || !sectionMask)
+            return;
+        {
+            std::lock_guard<std::mutex> lock(g_remoteClearMu);
+            OwnerGuid key = owner;
+            for (const auto& kv : g_remoteDeferredClearMask)
+            {
+                if (GuidSamePlayer(kv.first, owner))
+                {
+                    key = kv.first;
+                    break;
+                }
+            }
+            g_remoteDeferredClearMask[key] |= sectionMask;
+        }
+        g_remoteClearDue.store(GetTickCount() + 450u, std::memory_order_relaxed);
+    }
+
+    void FlushDeferredRemoteClears()
+    {
+        const uint32_t due = g_remoteClearDue.load(std::memory_order_relaxed);
+        if (due == 0 || GetTickCount() < due)
+            return;
+        g_remoteClearDue.store(0, std::memory_order_relaxed);
+        std::vector<std::pair<OwnerGuid, uint32_t>> jobs;
+        {
+            std::lock_guard<std::mutex> lock(g_remoteClearMu);
+            jobs.assign(g_remoteDeferredClearMask.begin(), g_remoteDeferredClearMask.end());
+            g_remoteDeferredClearMask.clear();
+        }
+        for (const auto& job : jobs)
+        {
+            if (!job.second)
+                continue;
+            for (int s = 0; s < kMaxEquipSlots; ++s)
+            {
+                const uint32_t m = SectionMaskForEquipSlot(s);
+                if (!m || (job.second & m) == 0)
+                    continue;
+                DirtyOwnerSections(job.first, m);
+            }
+        }
+    }
+
+    void ScheduleOwnerSectionRebuild(OwnerGuid owner, uint32_t sectionMask)
+    {
+        if (!owner || sectionMask == 0)
+            return;
+        {
+            std::lock_guard<std::mutex> lock(g_ownerCoalesceMu);
+            g_ownerCoalesceMask[owner] |= sectionMask;
+        }
+        g_ownerCoalesceDue.store(GetTickCount() + 32u, std::memory_order_relaxed);
+    }
+
+    void FlushCoalescedOwnerRebuild()
+    {
+        const uint32_t due = g_ownerCoalesceDue.load(std::memory_order_relaxed);
+        if (due == 0 || GetTickCount() < due)
+            return;
+        g_ownerCoalesceDue.store(0, std::memory_order_relaxed);
+        std::vector<std::pair<OwnerGuid, uint32_t>> jobs;
+        {
+            std::lock_guard<std::mutex> lock(g_ownerCoalesceMu);
+            jobs.assign(g_ownerCoalesceMask.begin(), g_ownerCoalesceMask.end());
+            g_ownerCoalesceMask.clear();
+        }
+        const OwnerGuid self = ActiveOwnerGuid();
+        for (const auto& job : jobs)
+        {
+            if (!self || !GuidSamePlayer(job.first, self))
+                continue;
+            ForceOwnerPerSlotMasks(job.first, job.second);
+        }
+    }
+
+    void FlushPendingRemoteApplies()
+    {
+        // Login PUSH often arrives before CharComponent exists (force hasComp:0).
+        // pending_force never fired in logs — retry here once the unit is visible,
+        // Force per active tint slot (never OR'd mega-mask).
+        std::vector<OwnerGuid> owners;
+        {
+            std::lock_guard<std::mutex> lock(g_remoteMu);
+            owners.reserve(g_remotePendingDirty.size());
+            for (const auto& kv : g_remotePendingDirty)
+            {
+                if (kv.second)
+                    owners.push_back(kv.first);
+            }
+        }
+        for (OwnerGuid owner : owners)
+        {
+            void* unitModel = nullptr;
+            void* component = FindOwnerCharComponent(owner, &unitModel);
+            if (!component)
+                continue;
+            const uint32_t pending = TakeRemotePendingMask(owner);
+            if (!pending)
+                continue;
+            SetComponentSectionDirtyReplaceSeh(component, pending);
+        }
+    }
+
+    void FlushCoalescedLocalRebuild()
+    {
+        FlushCoalescedOwnerRebuild();
+        FlushDeferredRemoteClears();
+        FlushPendingRemoteApplies();
+    }
+
+    uint32_t ActiveLocalSectionMask()
+    {
+        uint32_t mask = 0;
+        std::lock_guard<std::mutex> lock(g_colorMutex);
+        for (int s = 0; s < kMaxEquipSlots; ++s)
+        {
+            if (g_slotHsl[static_cast<size_t>(s)].active)
+                mask |= SectionMaskForEquipSlot(s);
+        }
+        return mask;
+    }
+
+    void ScheduleLocalSectionRebuild(uint32_t sectionMask)
+    {
+        if (sectionMask == 0)
+            return;
+        const OwnerGuid self = ActiveOwnerGuid();
+        if (!self)
+            return;
+        ScheduleOwnerSectionRebuild(self, sectionMask);
     }
 
     void ForceAllowedBodyRebuildForSlot(int slot)
     {
-        const uint32_t mask = SectionMaskForEquipSlot(slot);
-        if (mask == 0)
+        if (slot < 0)
             return;
-
-        void* playerModel = LocalPlayerBodyModel();
-        void* local = g_localPlayerComponent.load(std::memory_order_relaxed);
-        void* preview = g_previewComponent.load(std::memory_order_relaxed);
-
-        if (!playerModel)
-        {
-            // Char-select / glue: keep sticky component — do NOT ClearPlayerScope.
-            if (local && ComponentModel(local))
-            {
-                ForceComponentRebuild(local, mask);
-            }
-            if (preview && preview != local)
-                ForceComponentRebuild(preview, mask);
-            if (!local && !preview)
-                g_pendingPreviewForce.store(true, std::memory_order_relaxed);
-            return;
-        }
-
-        if (local && !ComponentBelongsToLocalPlayer(local))
-        {
-            g_localPlayerComponent.store(nullptr, std::memory_order_relaxed);
-            local = nullptr;
-        }
-        if (local)
-            ForceComponentRebuild(local, mask);
-        if (preview && preview != local)
-            ForceComponentRebuild(preview, mask);
-        else if (!preview && g_previewUiActive.load(std::memory_order_relaxed))
-            g_pendingPreviewForce.store(true, std::memory_order_relaxed);
+        ScheduleLocalSectionRebuild(SectionMaskForEquipSlot(slot));
     }
 
-    void ForcePreviewOnlyRebuildForSlot(int slot)
-    {
-        const uint32_t mask = SectionMaskForEquipSlot(slot);
-        if (mask == 0)
-            return;
-        void* preview = g_previewComponent.load(std::memory_order_relaxed);
-        if (preview)
-            ForceComponentRebuild(preview, mask);
-        else if (g_previewUiActive.load(std::memory_order_relaxed))
-            g_pendingPreviewForce.store(true, std::memory_order_relaxed);
-        ArmPreviewCapture(800);
-    }
-
-    // During pushAll / multi-rule SetSlotSelective, skip per-slot rebuilds — they
-    // re-paste partial section masks and destroy the clean char-select composite.
+    // During pushAll / multi-rule SetSlotSelective, skip per-slot rebuilds.
     void RequestBodyRebuildForSlot(int slot)
     {
         if (g_rebuildBatchDepth.load(std::memory_order_relaxed) > 0)
@@ -1271,9 +2630,6 @@ namespace
         if (d < 0)
             g_rebuildBatchDepth.store(0, std::memory_order_relaxed);
 
-        const uint32_t nat = g_naturalTintPastes.load(std::memory_order_relaxed);
-        const bool hasPlayer = LocalPlayerBodyModel() != nullptr;
-
         // Boot / enter-world sync: colors only. Forcing a full 0x3FF rebuild after the
         // engine already assembled with live paste tints is what made in-world look
         // worse than char-select Enter World.
@@ -1282,7 +2638,11 @@ namespace
 
         g_pendingEnterWorldRebuild.store(false, std::memory_order_relaxed);
         g_deferredFullRebuildAt.store(0, std::memory_order_relaxed);
-        ForceAllowedBodyRebuildForSlot(-1);
+        // Only sections with active local tint — never mask 1023.
+        const uint32_t mask = ActiveLocalSectionMask();
+        if (mask == 0)
+            return;
+        ScheduleLocalSectionRebuild(mask);
     }
 
     void EndBodyRebuildBatch()
@@ -1290,10 +2650,10 @@ namespace
         EndBodyRebuildBatch(true);
     }
 
-    // Back-compat wrapper used by Lua preview refresh (full body).
+    // Back-compat wrapper used by Lua preview refresh — active tint sections only.
     void ForceAllowedBodyRebuild()
     {
-        ForceAllowedBodyRebuildForSlot(-1);
+        ScheduleLocalSectionRebuild(ActiveLocalSectionMask());
     }
 
     int __fastcall hkRenderPrep(void* component, void* /*edx*/, int a2)
@@ -1302,14 +2662,12 @@ namespace
         void* model = ComponentModel(component);
         void* playerModel = LocalPlayerBodyModel();
         const bool isNpc = ComponentIsNpc(component);
-        const uint32_t flags = SafeReadU32(component, kOffComponentFlags);
-        void* sticky = g_localPlayerComponent.load(std::memory_order_relaxed);
-        const bool locked = g_playerModelLocked.load(std::memory_order_relaxed);
         const char* reason = "deny";
+        const OwnerGuid self = ActiveOwnerGuid();
 
-        // Logout / return to glue: ActivePlayerGuid clears. Always flush tex cache
-        // here — waiting only on `locked` missed some transitions and left stale
-        // g_texTint keyed by freed pointers (restart was the only recovery).
+        if (component && model && !isNpc)
+            RememberModelComponent(model, component);
+
         {
             static std::atomic<bool> s_wasWorldPlayer{ false };
             if (playerModel)
@@ -1320,194 +2678,96 @@ namespace
 
         if (component && !isNpc)
         {
-            if (playerModel && model && model == playerModel)
+            if (playerModel && model == playerModel)
             {
                 allowed = true;
-                reason = "player_model";
+                reason = "local";
                 g_localPlayerComponent.store(component, std::memory_order_relaxed);
                 g_playerModelLocked.store(true, std::memory_order_relaxed);
-            }
-            else if (sticky && component == sticky)
-            {
-                // Stale after logout: sticky must still belong to the live player.
-                // Char-select / glue: no ActivePlayerGuid — keep optimism sticky.
-                if (playerModel && ComponentModel(sticky) == playerModel)
-                {
-                    allowed = true;
-                    reason = "sticky_component";
-                }
-                else if (!playerModel && model && model == ComponentModel(sticky))
-                {
-                    allowed = true;
-                    reason = "charselect_sticky";
-                    g_localPlayerModel.store(model, std::memory_order_relaxed);
-                }
-                else if (!playerModel && model)
-                {
-                    // Component model moved (char re-selected) — retarget sticky.
-                    allowed = true;
-                    reason = "charselect_retarget";
-                    g_localPlayerComponent.store(component, std::memory_order_relaxed);
-                    g_localPlayerModel.store(model, std::memory_order_relaxed);
-                }
-                else
-                {
-                    g_localPlayerComponent.store(nullptr, std::memory_order_relaxed);
-                    reason = "sticky_stale";
-                }
-            }
-            else if (!locked && !playerModel && model && !sticky)
-            {
-                // Glue one-shot ONLY when we have no sticky yet. Never re-enter
-                // optimism for other CharComponents — that tinted every loading
-                // unit's TextureComponents (other PCs / shared cache corruption).
-                // Logs: localOk:2 reason:3 on full body pastes = this path.
-                allowed = true;
-                reason = "login_optimism";
-                g_localPlayerComponent.store(component, std::memory_order_relaxed);
-                g_localPlayerModel.store(model, std::memory_order_relaxed);
-            }
-            else if (!locked && !playerModel && model && sticky && component != sticky)
-            {
-                reason = "glue_other_deny";
+                g_prepOwnerGuid.store(self, std::memory_order_relaxed);
             }
             else
             {
-                const uint32_t now = GetTickCount();
-                const uint32_t until = g_previewCaptureUntil.load(std::memory_order_relaxed);
-                if (g_previewUiActive.load(std::memory_order_relaxed) && now <= until && model)
+                OwnerGuid remoteOwner = 0;
+                if (model && BodyModelOwnerGuid(model, remoteOwner)
+                    && remoteOwner != 0 && !GuidSamePlayer(remoteOwner, self))
                 {
-                    const void* prevModel = g_previewModel.load(std::memory_order_relaxed);
-                    g_previewModel.store(model, std::memory_order_relaxed);
-                    g_previewComponent.store(component, std::memory_order_relaxed);
-                    allowed = true;
-                    reason = "preview_capture";
-                    RegisterUiOcRoot(model);
-                    const bool pending = g_pendingPreviewForce.exchange(
-                        false, std::memory_order_relaxed);
-                    if ((pending || model != prevModel) && AnySlotActive())
+                    const bool pending = PeekRemotePendingDirty(remoteOwner);
+                    const bool hasTint = OwnerHasAnyRemoteTint(remoteOwner);
+                    if (hasTint || pending)
                     {
-                        // Dress often calls RenderPrep(a2=0) with clean sections — force
-                        // a body paste when preview model is (re)captured.
-                        __try
+                        allowed = true;
+                        reason = "remote";
+                        g_prepOwnerGuid.store(remoteOwner, std::memory_order_relaxed);
+                        RememberRemoteCc(remoteOwner, component, model);
+                        if (pending)
                         {
-                            *reinterpret_cast<uint32_t*>(
-                                static_cast<uint8_t*>(component) + kOffComponentSectionDirty)
-                                |= SectionMaskForEquipSlot(-1);
-                            *reinterpret_cast<uint32_t*>(
-                                static_cast<uint8_t*>(component) + 0x08) |= 0x1u;
-                        }
-                        __except (EXCEPTION_EXECUTE_HANDLER)
-                        {
+                            const uint32_t mask = TakeRemotePendingMask(remoteOwner);
+                            if (mask)
+                            {
+                                SetComponentSectionDirtyReplaceSeh(component, mask);
+                                g_forceAllowPaste.store(true, std::memory_order_relaxed);
+                            }
                         }
                     }
                 }
-                else if (model && model == g_previewModel.load(std::memory_order_relaxed))
-                {
-                    allowed = true;
-                    reason = "preview_model";
-                    g_previewComponent.store(component, std::memory_order_relaxed);
-                    RegisterUiOcRoot(model);
-                }
-                else if (!playerModel)
-                    reason = "no_player_model";
-                else if (!model)
-                    reason = "no_comp_model";
-                else
-                    reason = "model_mismatch";
             }
         }
-        else if (!component)
-            reason = "no_component";
         else if (isNpc)
             reason = "npc_flag";
 
-        if (!playerModel && locked)
+        if (!playerModel && g_playerModelLocked.load(std::memory_order_relaxed))
             ClearPlayerScope();
 
-        // Char-select: assembled models often arrive with clean section bits — dirty
-        // once per sticky model so body TextureComponents pick up saved colors.
-        if (allowed && !playerModel && AnySlotActive() && component && model)
+        if (!allowed)
         {
-            void* prevDirty = g_charselectDirtyModel.load(std::memory_order_relaxed);
-            if (model != prevDirty)
+            const OwnerGuid fo = g_forceOwnerGuid.load(std::memory_order_relaxed);
+            void* om = fo ? OwnerBodyModel(fo) : nullptr;
+            if (fo && model && om && model == om
+                && g_forceAllowPaste.load(std::memory_order_relaxed))
             {
-                g_charselectDirtyModel.store(model, std::memory_order_relaxed);
-                __try
-                {
-                    *reinterpret_cast<uint32_t*>(
-                        static_cast<uint8_t*>(component) + kOffComponentSectionDirty)
-                        |= SectionMaskForEquipSlot(-1);
-                    *reinterpret_cast<uint32_t*>(
-                        static_cast<uint8_t*>(component) + 0x08) |= 0x1u;
-                }
-                __except (EXCEPTION_EXECUTE_HANDLER)
-                {
-                }
+                allowed = true;
+                reason = "force_owner";
+                g_prepOwnerGuid.store(fo, std::memory_order_relaxed);
+                if (!GuidSamePlayer(fo, self))
+                    RememberRemoteCc(fo, component, model);
             }
         }
-
-        // Preview body refresh is driven by capture dirty + WXL_RecolorForceBodyRebuild.
-
 
         g_prepModel.store(model, std::memory_order_relaxed);
+        if (!allowed)
+            g_prepOwnerGuid.store(0, std::memory_order_relaxed);
+
+        uint32_t code = 0;
+        if (allowed)
         {
-            uint32_t code = 0;
-            if (allowed)
-            {
-                if (std::strcmp(reason, "player_model") == 0)
-                    code = 1;
-                else if (std::strcmp(reason, "sticky_component") == 0
-                    || std::strcmp(reason, "charselect_sticky") == 0
-                    || std::strcmp(reason, "charselect_retarget") == 0)
-                    code = 2;
-                else if (std::strcmp(reason, "login_optimism") == 0)
-                    code = 4;
-                else
-                    code = 3; // preview / other
-            }
-            g_prepReasonCode.store(code, std::memory_order_relaxed);
+            if (std::strcmp(reason, "local") == 0)
+                code = 1;
+            else if (std::strcmp(reason, "remote") == 0
+                || std::strcmp(reason, "force_owner") == 0)
+                code = 5;
         }
+        g_prepReasonCode.store(code, std::memory_order_relaxed);
         g_assemblingAllowed.store(allowed, std::memory_order_relaxed);
-        const int rc = g_origRenderPrep
-            ? g_origRenderPrep(component, a2)
-            : 0;
+
+        ReProbeRenderPrep(component, model, a2, isNpc, reason, allowed, self, playerModel);
+
+        const int rc = CallOrigRenderPrepSeh(component, a2);
+        g_forceAllowPaste.store(false, std::memory_order_relaxed);
         g_assemblingAllowed.store(false, std::memory_order_relaxed);
         g_prepModel.store(nullptr, std::memory_order_relaxed);
+        g_prepOwnerGuid.store(0, std::memory_order_relaxed);
         g_prepReasonCode.store(0, std::memory_order_relaxed);
 
-        // After world player locks: if natural paste already tinted (char-select
-        // quality path), do NOT ForceComponentRebuild — that was the "adjustment"
-        // that looked worse than Enter World. Only arm a deferred force when zero
-        // natural tints were seen (colors applied too late).
         if (allowed && component && AnySlotActive()
             && g_pendingEnterWorldRebuild.load(std::memory_order_relaxed)
-            && (std::strcmp(reason, "player_model") == 0
-                || std::strcmp(reason, "sticky_component") == 0))
+            && std::strcmp(reason, "local") == 0)
         {
             g_pendingEnterWorldRebuild.store(false, std::memory_order_relaxed);
-            const uint32_t nat = g_naturalTintPastes.load(std::memory_order_relaxed);
-            if (nat == 0)
-                g_deferredFullRebuildAt.store(GetTickCount() + 600u, std::memory_order_relaxed);
-            else
-                g_deferredFullRebuildAt.store(0, std::memory_order_relaxed);
-        }
-
-        const uint32_t due = g_deferredFullRebuildAt.load(std::memory_order_relaxed);
-        if (due != 0 && GetTickCount() >= due
-            && allowed && component
-            && !g_insideForcedRebuild.load(std::memory_order_relaxed)
-            && g_rebuildBatchDepth.load(std::memory_order_relaxed) == 0
-            && AnySlotActive()
-            && (std::strcmp(reason, "player_model") == 0
-                || std::strcmp(reason, "sticky_component") == 0))
-        {
             g_deferredFullRebuildAt.store(0, std::memory_order_relaxed);
-            g_insideForcedRebuild.store(true, std::memory_order_relaxed);
-            ForceComponentRebuild(component, SectionMaskForEquipSlot(-1));
-            g_insideForcedRebuild.store(false, std::memory_order_relaxed);
         }
 
+        FlushCoalescedLocalRebuild();
         return rc;
     }
 
@@ -1529,8 +2789,80 @@ namespace
         uint32_t h = 0;
     };
     std::unordered_map<void*, TexTintCache> g_texTint;
+    // Canonical CLEAN pixels per texture path. TextureCacheCreate always returns the
+    // shared handle (logs: same:1 on 238/238 clones) — player isolation = restore
+    // from this map before every paste, tint briefly, restore after. Never trust
+    // void*-only orig (rest0:0 always when path was never keyed).
+    std::unordered_map<std::string, TexTintCache> g_pathOrig;
     wxl::offsets::engine::gx::CharPasteToSectionFn g_origPasteToSection = nullptr;
     wxl::offsets::engine::gx::CharPasteToSectionFn g_origPasteFromSkin = nullptr;
+    wxl::offsets::engine::gx::TextureCacheGetPalFn g_origGetPal = nullptr;
+    wxl::offsets::engine::gx::TextureCacheGetMipFn g_origGetMip = nullptr;
+
+    // Private tint view for the duration of one native PasteToSection call.
+    // GetPal/GetMip return these buffers so the shared TextureCache is never
+    // written (fixes phantom + wipe from in-place mutate/restore races).
+    struct PasteTintOverlay
+    {
+        void* tex = nullptr;
+        bool active = false;
+        bool paletted = false;
+        uint32_t w = 0;
+        uint32_t h = 0;
+        alignas(16) uint8_t pal[256 * 4]{};
+        std::vector<uint8_t> bgra;
+    };
+    thread_local PasteTintOverlay g_tlsPasteOverlay;
+
+    void ClearPasteTintOverlay()
+    {
+        g_tlsPasteOverlay.active = false;
+        g_tlsPasteOverlay.tex = nullptr;
+        g_tlsPasteOverlay.paletted = false;
+        g_tlsPasteOverlay.w = 0;
+        g_tlsPasteOverlay.h = 0;
+        g_tlsPasteOverlay.bgra.clear();
+    }
+
+    uint8_t* SafeOrigGetPal(void* tex) noexcept
+    {
+        if (!tex || !g_origGetPal)
+            return nullptr;
+        __try { return g_origGetPal(tex); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+    }
+
+    uint8_t* SafeOrigGetMip(void* tex, uint32_t mip) noexcept
+    {
+        if (!tex || !g_origGetMip)
+            return nullptr;
+        __try { return g_origGetMip(tex, mip); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+    }
+
+    uint8_t* __cdecl hkTextureCacheGetPal(void* tex)
+    {
+        if (!tex)
+            return nullptr;
+        if (g_tlsPasteOverlay.active && tex == g_tlsPasteOverlay.tex
+            && g_tlsPasteOverlay.paletted)
+            return g_tlsPasteOverlay.pal;
+        return SafeOrigGetPal(tex);
+    }
+
+    uint8_t* __cdecl hkTextureCacheGetMip(void* tex, uint32_t mip)
+    {
+        if (!tex)
+            return nullptr;
+        if (g_tlsPasteOverlay.active && tex == g_tlsPasteOverlay.tex
+            && !g_tlsPasteOverlay.paletted && mip == 0u
+            && !g_tlsPasteOverlay.bgra.empty())
+            return g_tlsPasteOverlay.bgra.data();
+        return SafeOrigGetMip(tex, mip);
+    }
+
+    void* LoadTextureCacheByPath(const char* path) noexcept; // defined below
+    int SafeGetInfo(void* tex, void* info, int flag) noexcept; // defined below
 
     // Durable Catch samples: captured while TextureCache/mip-table pixels are live.
     // Stale void* handles after unload return GetPal=null — never rely on them at Catch time.
@@ -1546,47 +2878,22 @@ namespace
     std::mutex g_catchMu;
     CatchSample g_catchSample[kMaxEquipSlots];
 
-    // Remember recent item pastes so HSL slider changes can re-tint composites live
-    // (DressUpModel preview + world body) without equip/unequip.
-    struct LivePaste
-    {
-        int section = 0;
-        void* src = nullptr;
-        void* dst = nullptr;
-        int slot = -1;
-    };
-    constexpr int kMaxLivePastes = 96;
-    std::mutex g_livePasteMu;
-    LivePaste g_livePastes[kMaxLivePastes];
-    int g_livePasteN = 0;
 
-    void RememberLivePaste(int section, void* src, void* dst, int slot)
+    void ClearCatchSampleForSlot(int slot)
     {
-        // slot >= 0: item component; slot == -2: base skin layout layer
-        if (!src || !dst || slot < -2 || slot == -1)
+        if (slot < 0 || slot >= kMaxEquipSlots)
             return;
-        std::lock_guard<std::mutex> lock(g_livePasteMu);
-        // One entry per (section, src, dst) layer. NEVER collapse by section alone —
-        // CharAssemble pastes pant+belt into the same section; keeping only the last
-        // made slider replay replace pants with boots (etc.).
-        for (int i = 0; i < g_livePasteN; ++i)
-        {
-            if (g_livePastes[i].dst == dst
-                && g_livePastes[i].section == section
-                && g_livePastes[i].src == src)
-            {
-                g_livePastes[i].slot = slot;
-                return;
-            }
-        }
-        if (g_livePasteN < kMaxLivePastes)
-        {
-            g_livePastes[g_livePasteN++] = { section, src, dst, slot };
-            return;
-        }
-        static int s_rot = 0;
-        g_livePastes[s_rot % kMaxLivePastes] = { section, src, dst, slot };
-        ++s_rot;
+        std::lock_guard<std::mutex> lock(g_catchMu);
+        g_catchSample[slot] = {};
+    }
+
+    // Local body slot unequip / replace: purge stale paste refs so section offsets
+    // cannot keep painting the previous item after vanilla reuses the composite.
+    void OnLocalBodySlotRefsCleared(int slot)
+    {
+        ClearCatchSampleForSlot(slot);
+        if (IsBodyEquipSlot(slot))
+            RequestBodyRebuildForSlot(slot);
     }
 
     bool IsItemComponentTexture(const char* name)
@@ -1617,7 +2924,18 @@ namespace
         return true;
     }
 
-    std::atomic<bool> g_ocPixelTintLive{ false }; // unused: mesh always used for OC live
+    bool IsObjectComponentPathSane(const char* name)
+    {
+        if (!name)
+            return false;
+        // wxl-equip-extension can skip bad stems; never touch orphan OC paths here.
+        if (ContainsCI(name, "\\glove\\") && ContainsCI(name, "shoulder"))
+            return false;
+        if (ContainsCI(name, "/glove/") && ContainsCI(name, "shoulder"))
+            return false;
+        return true;
+    }
+
     std::atomic<uint32_t> g_ocUploadOk{ 0 };
     std::atomic<uint32_t> g_ocUploadFail{ 0 };
     std::atomic<int> g_hslPsState{ -1 }; // -1 unknown, 0 fail, 1 ok
@@ -1647,23 +2965,223 @@ namespace
         return -1;
     }
 
-    bool TryHslForComponentTexture(const char* name, SlotHsl& out, int* outSlot)
+    int ScoreComponentSlotMatch(int compIdx, int pathComp, int slot)
     {
-        const int mapped = SlotForComponentTexture(name);
-        if (mapped >= 0 && TrySlotHsl(mapped, out))
+        int score = 0;
+        if (pathComp >= 0 && pathComp == compIdx)
+            score += 8;
+        switch (compIdx)
         {
-            if (outSlot)
-                *outSlot = mapped;
-            return true;
+        case 3: case 4:
+            if (slot == 4)
+                score += 4;
+            else if (slot == 3)
+                score += 2;
+            break;
+        case 5:
+            if (slot == 5)
+                score += 4;
+            else if (slot == 6)
+                score += 2;
+            break;
+        case 6:
+            if (slot == 6)
+                score += 4;
+            break;
+        case 7:
+            if (slot == 7)
+                score += 4;
+            break;
+        case 0: case 1:
+            if (slot == 8)
+                score += 4;
+            break;
+        case 2:
+            if (slot == 9)
+                score += 4;
+            break;
+        default:
+            break;
         }
-        // Shirt (3) may drive chest (4) components when chest HSL is inactive.
-        if (mapped == 4 && TrySlotHsl(3, out))
+        return score;
+    }
+
+    // Stem match for one owner (no RenderPrep context required).
+    bool MatchComponentTextureForOwner(OwnerGuid owner, const char* name,
+        int pasteSection, SlotHsl& out, int& outSlot)
+    {
+        owner = CanonicalTintOwner(owner);
+        if (!owner || !name || !IsItemComponentTexture(name))
+            return false;
+        if (!EquipSnapKnown(owner))
+            return false;
+
+        const int pathComp = ComponentIndexFromTexturePath(name);
+        int compIdx = pathComp;
+        if (compIdx < 0 && pasteSection >= 0 && pasteSection < 8)
+            compIdx = pasteSection;
+        if (compIdx < 0 || compIdx >= 8)
+            return false;
+
+        int bestSlot = -1;
+        int bestScore = -1;
+        auto consider = [&](int slot, int scoreBonus)
         {
-            if (outSlot)
-                *outSlot = 3;
-            return true;
+            if (slot < 0 || slot >= kMaxEquipSlots)
+                return;
+            if (EquipSnapEntry(owner, slot) == 0)
+                return;
+            DisplaySlotInfo info{};
+            if (!GetDisplaySlotInfo(owner, slot, info))
+                return;
+            if (!PathMatchesSlotComponent(name, info, compIdx))
+                return;
+            SlotHsl hsl{};
+            if (!TrySlotHslForOwner(owner, slot, hsl))
+                return;
+            const int score = ScoreComponentSlotMatch(compIdx, pathComp, slot)
+                + scoreBonus;
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestSlot = slot;
+            }
+        };
+
+        // Primary: any tinted slot whose ItemDisplayInfo owns this component stem
+        // (chest tint must hit sleeve_au/bracer_al from the same chest piece).
+        for (int slot = 0; slot < kMaxEquipSlots; ++slot)
+            consider(slot, 8);
+
+        // Fallback: legacy compIdx → equip slot candidates.
+        if (bestSlot < 0)
+        {
+            int slotCands[4];
+            int nSlotCands = 0;
+            CandidateEquipSlotsForComponent(compIdx, slotCands, nSlotCands);
+            for (int si = 0; si < nSlotCands; ++si)
+                consider(slotCands[si], 0);
         }
-        return false;
+
+        if (bestSlot < 0)
+            return false;
+        if (!TrySlotHslForOwner(owner, bestSlot, out))
+            return false;
+        outSlot = bestSlot;
+        return true;
+    }
+
+    void CollectTintedOwners(std::vector<OwnerGuid>& out)
+    {
+        out.clear();
+        const OwnerGuid self = ActiveOwnerGuid();
+        if (self)
+            out.push_back(self);
+        std::lock_guard<std::mutex> lock(g_remoteMu);
+        for (const auto& kv : g_remoteTints)
+        {
+            if (!OwnerHasAnyTintLocked(kv.second))
+                continue;
+            bool dup = false;
+            for (OwnerGuid g : out)
+            {
+                if (GuidSamePlayer(g, kv.first))
+                {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup)
+                out.push_back(kv.first);
+        }
+    }
+
+    // Paste outside RenderPrep: resolve owner from texture stem + equip snap.
+    bool ResolveOrphanPasteOwner(const char* name, int pasteSection,
+        OwnerGuid& outOwner, SlotHsl& outHsl, int& outSlot)
+    {
+        outOwner = 0;
+        outSlot = -1;
+        if (!name || !IsItemComponentTexture(name))
+            return false;
+
+        std::vector<OwnerGuid> owners;
+        CollectTintedOwners(owners);
+        OwnerGuid bestOwner = 0;
+        int bestSlot = -1;
+        SlotHsl bestHsl{};
+        int bestScore = -1;
+        for (OwnerGuid owner : owners)
+        {
+            SlotHsl hsl{};
+            int slot = -1;
+            if (!MatchComponentTextureForOwner(owner, name, pasteSection, hsl, slot))
+                continue;
+            const int pathComp = ComponentIndexFromTexturePath(name);
+            int compIdx = pathComp;
+            if (compIdx < 0 && pasteSection >= 0 && pasteSection < 8)
+                compIdx = pasteSection;
+            const int score = ScoreComponentSlotMatch(compIdx, pathComp, slot);
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestOwner = owner;
+                bestSlot = slot;
+                bestHsl = hsl;
+            }
+        }
+        if (!bestOwner || bestSlot < 0)
+            return false;
+        outOwner = bestOwner;
+        outSlot = bestSlot;
+        outHsl = bestHsl;
+        return true;
+    }
+
+    // Same path for self + remote: stem must match ItemDisplayInfo for that slot.
+    bool TryHslForComponentTexture(const char* name, int pasteSection, SlotHsl& out, int* outSlot)
+    {
+        if (!name || !IsItemComponentTexture(name))
+            return false;
+
+        OwnerGuid owner = CanonicalTintOwner(
+            g_prepOwnerGuid.load(std::memory_order_relaxed));
+        if (owner == 0)
+        {
+            void* prep = g_prepModel.load(std::memory_order_relaxed);
+            void* pm = LocalPlayerBodyModel();
+            if (!pm || prep != pm)
+                return false;
+            owner = ActiveOwnerGuid();
+            if (!owner)
+                return false;
+        }
+
+        int slot = -1;
+        if (!MatchComponentTextureForOwner(owner, name, pasteSection, out, slot))
+            return false;
+        if (outSlot)
+            *outSlot = slot;
+
+        // #region agent log
+        {
+            const OwnerGuid self = ActiveOwnerGuid();
+            const bool isRemoteCtx = self != 0 && !GuidSamePlayer(owner, self);
+            if (isRemoteCtx && g_dbgTryHslN.fetch_add(1, std::memory_order_relaxed) < 60)
+            {
+                char stem[kStemCap] = {};
+                DbgTexBasename615(name, stem, sizeof(stem));
+                DisplaySlotInfo di{};
+                uint32_t dispId = 0;
+                if (GetDisplaySlotInfo(owner, slot, di))
+                    dispId = di.displayId;
+                DbgLog615("H1", "TryHslForComponentTexture",
+                    "chosen", static_cast<unsigned long long>(owner), slot, pasteSection, stem,
+                    ComponentIndexFromTexturePath(name), 0, dispId);
+            }
+        }
+        // #endregion
+        return true;
     }
 
     const char* TextureNameFromHandleField(void* handle) noexcept
@@ -1699,13 +3217,15 @@ namespace
 
     bool AnySlotActive()
     {
-        std::lock_guard<std::mutex> lock(g_colorMutex);
-        for (int i = 0; i < kMaxEquipSlots; ++i)
         {
-            if (g_slotHsl[i].active || g_draftHsl[i].active)
-                return true;
+            std::lock_guard<std::mutex> lock(g_colorMutex);
+            for (int i = 0; i < kMaxEquipSlots; ++i)
+            {
+                if (g_slotHsl[i].active || g_draftHsl[i].active)
+                    return true;
+            }
         }
-        return false;
+        return AnyRemoteTintActive();
     }
 
     int SafeHasMips(void* tex) noexcept
@@ -1718,16 +3238,21 @@ namespace
 
     uint8_t* SafeGetPal(void* tex) noexcept
     {
-        auto fn = reinterpret_cast<wxl::offsets::engine::gx::TextureCacheGetPalFn>(
-            wxl::offsets::engine::gx::kTextureCacheGetPal);
+        // Prefer trampoline so we never re-enter hk while building overlays.
+        auto fn = g_origGetPal
+            ? g_origGetPal
+            : reinterpret_cast<wxl::offsets::engine::gx::TextureCacheGetPalFn>(
+                wxl::offsets::engine::gx::kTextureCacheGetPal);
         __try { return fn(tex); }
         __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
     }
 
     uint8_t* SafeGetMip(void* tex, uint32_t mip) noexcept
     {
-        auto fn = reinterpret_cast<wxl::offsets::engine::gx::TextureCacheGetMipFn>(
-            wxl::offsets::engine::gx::kTextureCacheGetMip);
+        auto fn = g_origGetMip
+            ? g_origGetMip
+            : reinterpret_cast<wxl::offsets::engine::gx::TextureCacheGetMipFn>(
+                wxl::offsets::engine::gx::kTextureCacheGetMip);
         __try { return fn(tex, mip); }
         __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
     }
@@ -1735,7 +3260,6 @@ namespace
     void FlushTexTintState(const char* reason)
     {
         size_t cacheN = 0;
-        int liveN = 0;
         {
             std::lock_guard<std::mutex> lock(g_texMutex);
             cacheN = g_texTint.size();
@@ -1747,13 +3271,176 @@ namespace
             // Live paste path already restores while the pointer is still valid.
             g_texTint.clear();
             g_texNames.clear();
+            // Keep g_pathOrig — pure pixel bytes, not engine pointers.
         }
+    }
+
+    std::string TexPathKey(const char* name)
+    {
+        std::string s = name ? name : "";
+        for (char& c : s)
+            c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+        return s;
+    }
+
+    bool WriteCacheOrigToTex(void* tex, const TexTintCache& st)
+    {
+        if (!tex || st.orig.empty())
+            return false;
+        if (st.paletted)
         {
-            std::lock_guard<std::mutex> lock(g_livePasteMu);
-            liveN = g_livePasteN;
-            g_livePasteN = 0;
+            uint8_t* pal = SafeGetPal(tex);
+            if (!pal || st.orig.size() < 256 * 4)
+                return false;
+            std::memcpy(pal, st.orig.data(), 256 * 4);
+            return true;
         }
-        g_charselectDirtyModel.store(nullptr, std::memory_order_relaxed);
+        uint8_t* mip0 = SafeGetMip(tex, 0);
+        if (!mip0 || st.orig.size() < static_cast<size_t>(st.w) * st.h * 4u)
+            return false;
+        std::memcpy(mip0, st.orig.data(), st.orig.size());
+        return true;
+    }
+
+    // Read-only: fill g_pathOrig from tex on first sight. Never writes back to the
+    // shared TextureCache — overlay tinting reads from g_pathOrig only.
+    bool CapturePathOrigForOverlay(void* tex, const char* name)
+    {
+        if (!tex || !name || !name[0])
+            return false;
+        const std::string key = TexPathKey(name);
+        {
+            std::lock_guard<std::mutex> lock(g_texMutex);
+            auto pit = g_pathOrig.find(key);
+            if (pit != g_pathOrig.end() && !pit->second.orig.empty())
+            {
+                g_texTint[tex] = pit->second;
+                return true;
+            }
+        }
+
+        uint8_t* pal = SafeGetPal(tex);
+        TexTintCache neu{};
+        neu.path = name;
+        if (pal)
+        {
+            uint8_t info[8] = {};
+            uint32_t w = 0, h = 0;
+            if (SafeGetInfo(tex, info, 1))
+            {
+                w = *reinterpret_cast<uint16_t*>(info + 0);
+                h = *reinterpret_cast<uint16_t*>(info + 2);
+            }
+            uint8_t* mip0 = SafeGetMip(tex, 0);
+            neu.paletted = true;
+            neu.w = w;
+            neu.h = h;
+            neu.orig.assign(pal, pal + 256 * 4);
+            if (mip0 && w && h && w <= 2048 && h <= 2048)
+                neu.origIdx.assign(mip0, mip0 + static_cast<size_t>(w) * h);
+        }
+        else
+        {
+            uint8_t info[8] = {};
+            if (!SafeGetInfo(tex, info, 1))
+                return false;
+            const uint32_t w = *reinterpret_cast<uint16_t*>(info + 0);
+            const uint32_t h = *reinterpret_cast<uint16_t*>(info + 2);
+            uint8_t* mip0 = SafeGetMip(tex, 0);
+            if (!mip0 || !w || !h || w > 2048 || h > 2048)
+                return false;
+            neu.paletted = false;
+            neu.w = w;
+            neu.h = h;
+            neu.orig.assign(mip0, mip0 + static_cast<size_t>(w) * h * 4u);
+        }
+        if (neu.orig.empty())
+            return false;
+        {
+            std::lock_guard<std::mutex> lock(g_texMutex);
+            auto& slot = g_pathOrig[key];
+            if (slot.orig.empty())
+                slot = neu;
+            g_texTint[tex] = slot;
+        }
+        return true;
+    }
+
+    // Capture clean pixels into g_pathOrig (once per path) and mirror onto g_texTint[tex].
+    // If path already known, ALWAYS rewrite tex from canonical (scrub poison / foreign tint).
+    bool EnsurePathOrig(void* tex, const char* name)
+    {
+        if (!tex || !name || !name[0])
+            return false;
+        const std::string key = TexPathKey(name);
+
+        TexTintCache known{};
+        bool haveKnown = false;
+        {
+            std::lock_guard<std::mutex> lock(g_texMutex);
+            auto pit = g_pathOrig.find(key);
+            if (pit != g_pathOrig.end() && !pit->second.orig.empty())
+            {
+                known = pit->second;
+                haveKnown = true;
+            }
+        }
+        if (haveKnown)
+        {
+            if (!WriteCacheOrigToTex(tex, known))
+                return false;
+            std::lock_guard<std::mutex> lock(g_texMutex);
+            g_texTint[tex] = known;
+            return true;
+        }
+
+        // First sight of this path — capture from engine (should be clean BLP decode).
+        uint8_t* pal = SafeGetPal(tex);
+        TexTintCache neu{};
+        neu.path = name;
+        if (pal)
+        {
+            uint8_t info[8] = {};
+            uint32_t w = 0, h = 0;
+            if (SafeGetInfo(tex, info, 1))
+            {
+                w = *reinterpret_cast<uint16_t*>(info + 0);
+                h = *reinterpret_cast<uint16_t*>(info + 2);
+            }
+            uint8_t* mip0 = SafeGetMip(tex, 0);
+            neu.paletted = true;
+            neu.w = w;
+            neu.h = h;
+            neu.orig.assign(pal, pal + 256 * 4);
+            if (mip0 && w && h && w <= 2048 && h <= 2048)
+                neu.origIdx.assign(mip0, mip0 + static_cast<size_t>(w) * h);
+        }
+        else
+        {
+            uint8_t info[8] = {};
+            if (!SafeGetInfo(tex, info, 1))
+                return false;
+            const uint32_t w = *reinterpret_cast<uint16_t*>(info + 0);
+            const uint32_t h = *reinterpret_cast<uint16_t*>(info + 2);
+            uint8_t* mip0 = SafeGetMip(tex, 0);
+            if (!mip0 || !w || !h || w > 2048 || h > 2048)
+                return false;
+            neu.paletted = false;
+            neu.w = w;
+            neu.h = h;
+            neu.orig.assign(mip0, mip0 + static_cast<size_t>(w) * h * 4u);
+        }
+        if (neu.orig.empty())
+            return false;
+        {
+            std::lock_guard<std::mutex> lock(g_texMutex);
+            // Another thread may have filled it — keep first writer.
+            auto& slot = g_pathOrig[key];
+            if (slot.orig.empty())
+                slot = neu;
+            g_texTint[tex] = slot;
+        }
+        return true;
     }
 
     int SafeGetInfo(void* tex, void* info, int flag) noexcept
@@ -2294,209 +3981,135 @@ namespace
         }
     }
 
-    bool TintTextureCacheForPaste(void* tex, const char* name, const SlotHsl& hsl,
-                                  int slot, const char** outMode)
+    // Build a private tinted view and arm TLS so GetPal/GetMip feed native paste
+    // without mutating the shared TextureCache.
+    bool ArmPasteTintOverlay(void* tex, const char* name, const SlotHsl& hsl)
     {
-        if (outMode)
-            *outMode = "none";
+        ClearPasteTintOverlay();
         if (!tex || !hsl.active || IsIdentityHsl(hsl))
             return false;
 
-        const int has = SafeHasMips(tex);
-        if (has <= 0)
-        {
-            if (outMode)
-                *outMode = (has < 0) ? "hasmips_fault" : "no_mips";
-            return false;
-        }
-
+        TexTintCache src{};
         {
             std::lock_guard<std::mutex> lock(g_texMutex);
-            TexTintCache& st = g_texTint[tex];
-            if (st.path.empty() && name)
-                st.path = name;
-        }
-
-        uint8_t* pal = SafeGetPal(tex);
-        if (pal)
-        {
-            // Keep mip indices; tint the 256 palette from the cached ORIGINAL only.
-            // (Spatial expand/despeckle+index-remap was REJECTED: remapped thousands of
-            // pixels per paste and caused severe graphic corruption — see body-path logs.)
-            if (outMode)
-                *outMode = "palette_rgb";
-            uint8_t info[8] = {};
-            uint32_t w = 0, h = 0;
-            if (SafeGetInfo(tex, info, 1))
+            if (name && name[0])
             {
-                w = *reinterpret_cast<uint16_t*>(info + 0);
-                h = *reinterpret_cast<uint16_t*>(info + 2);
+                auto pit = g_pathOrig.find(TexPathKey(name));
+                if (pit != g_pathOrig.end() && !pit->second.orig.empty())
+                    src = pit->second;
             }
-            uint8_t* mip0 = SafeGetMip(tex, 0);
+            if (src.orig.empty())
             {
-                std::lock_guard<std::mutex> lock(g_texMutex);
-                TexTintCache& st = g_texTint[tex];
-                // Pointer reuse after logout: same void* may now be a different BLP.
-                if (!st.orig.empty() && name && !st.path.empty()
-                    && _stricmp(st.path.c_str(), name) != 0)
+                auto it = g_texTint.find(tex);
+                if (it != g_texTint.end() && !it->second.orig.empty())
+                    src = it->second;
+            }
+        }
+        if (src.orig.empty())
+            return false;
+
+        if (src.paletted)
+        {
+            if (src.orig.size() < 256 * 4)
+                return false;
+            std::memcpy(g_tlsPasteOverlay.pal, src.orig.data(), 256 * 4);
+            if (hsl.mode == 1)
+            {
+                // Reuse in-place selective path on the private palette copy.
+                uint8_t* pal = g_tlsPasteOverlay.pal;
+                for (int i = 0; i < 256; ++i)
                 {
-                    st = {};
-                }
-                if (st.path.empty() && name)
-                    st.path = name;
-                if (st.orig.empty())
-                {
-                    st.paletted = true;
-                    st.w = w;
-                    st.h = h;
-                    st.orig.assign(pal, pal + 256 * 4);
-                    if (mip0 && w && h && w <= 2048 && h <= 2048)
-                        st.origIdx.assign(mip0, mip0 + static_cast<size_t>(w) * h);
-                }
-                else if (st.origIdx.empty() && mip0 && w && h && w <= 2048 && h <= 2048)
-                {
-                    st.w = w;
-                    st.h = h;
-                    st.origIdx.assign(mip0, mip0 + static_cast<size_t>(w) * h);
-                }
-                if (st.orig.size() < 256 * 4)
-                    return false;
-                // Always re-tint from orig (never stack on already-tinted pal).
-                // Do NOT rewrite mip indices.
-                std::memcpy(pal, st.orig.data(), 256 * 4);
-                // Selective on palette: slightly harder gate than OC to limit fringe
-                // speckles without touching indices (soft despeckle cannot run on 256).
-                if (hsl.mode == 1)
-                {
-                    for (int i = 0; i < 256; ++i)
+                    float r = pal[i * 4 + 2] * (1.f / 255.f);
+                    float g = pal[i * 4 + 1] * (1.f / 255.f);
+                    float b = pal[i * 4 + 0] * (1.f / 255.f);
+                    float wmax = 0.f;
+                    if (hsl.ruleCount == 0)
                     {
-                        float r = pal[i * 4 + 2] * (1.f / 255.f);
-                        float g = pal[i * 4 + 1] * (1.f / 255.f);
-                        float b = pal[i * 4 + 0] * (1.f / 255.f);
-                        float wmax = 0.f;
-                        if (hsl.ruleCount == 0)
-                        {
-                            SelRule one{};
-                            one.sr = hsl.srcR; one.sg = hsl.srcG; one.sb = hsl.srcB;
-                            one.dr = hsl.hue; one.dg = hsl.sat; one.db = hsl.light;
-                            one.tol = hsl.tolerance;
-                            wmax = SelectiveWeight(r, g, b, one);
-                        }
-                        else
-                        {
-                            for (uint8_t ri = 0; ri < hsl.ruleCount; ++ri)
-                                wmax = (std::max)(wmax, SelectiveWeight(r, g, b, hsl.rules[ri]));
-                        }
-                        // Harder than mesh PS: skip weak palette fringe entries.
+                        SelRule one{};
+                        one.sr = hsl.srcR; one.sg = hsl.srcG; one.sb = hsl.srcB;
+                        one.dr = hsl.hue; one.dg = hsl.sat; one.db = hsl.light;
+                        one.tol = hsl.tolerance;
+                        wmax = SelectiveWeight(r, g, b, one);
                         if (wmax < 0.45f)
                             continue;
-                        if (hsl.ruleCount == 0)
-                        {
-                            SelRule one{};
-                            one.sr = hsl.srcR; one.sg = hsl.srcG; one.sb = hsl.srcB;
-                            one.dr = hsl.hue; one.dg = hsl.sat; one.db = hsl.light;
-                            one.tol = hsl.tolerance;
-                            ApplySelectiveWithWeight(r, g, b, one, wmax);
-                        }
-                        else
-                        {
-                            for (uint8_t ri = 0; ri < hsl.ruleCount; ++ri)
-                            {
-                                const float wi = SelectiveWeight(r, g, b, hsl.rules[ri]);
-                                if (wi >= 0.45f)
-                                    ApplySelectiveWithWeight(r, g, b, hsl.rules[ri], wi);
-                            }
-                        }
-                        pal[i * 4 + 2] = static_cast<uint8_t>(Clamp01(r) * 255.f + 0.5f);
-                        pal[i * 4 + 1] = static_cast<uint8_t>(Clamp01(g) * 255.f + 0.5f);
-                        pal[i * 4 + 0] = static_cast<uint8_t>(Clamp01(b) * 255.f + 0.5f);
+                        ApplySelectiveWithWeight(r, g, b, one, wmax);
                     }
-                }
-                else
-                {
-                    HslBgraBuffer(pal, 256, hsl, false);
+                    else
+                    {
+                        for (uint8_t ri = 0; ri < hsl.ruleCount; ++ri)
+                            wmax = (std::max)(wmax, SelectiveWeight(r, g, b, hsl.rules[ri]));
+                        if (wmax < 0.45f)
+                            continue;
+                        for (uint8_t ri = 0; ri < hsl.ruleCount; ++ri)
+                        {
+                            const float wi = SelectiveWeight(r, g, b, hsl.rules[ri]);
+                            if (wi >= 0.45f)
+                                ApplySelectiveWithWeight(r, g, b, hsl.rules[ri], wi);
+                        }
+                    }
+                    pal[i * 4 + 2] = static_cast<uint8_t>(Clamp01(r) * 255.f + 0.5f);
+                    pal[i * 4 + 1] = static_cast<uint8_t>(Clamp01(g) * 255.f + 0.5f);
+                    pal[i * 4 + 0] = static_cast<uint8_t>(Clamp01(b) * 255.f + 0.5f);
                 }
             }
+            else
+            {
+                HslBgraBuffer(g_tlsPasteOverlay.pal, 256, hsl, false);
+            }
+            g_tlsPasteOverlay.paletted = true;
+            g_tlsPasteOverlay.w = src.w;
+            g_tlsPasteOverlay.h = src.h;
+            g_tlsPasteOverlay.tex = tex;
+            g_tlsPasteOverlay.active = true;
             return true;
         }
 
-        uint8_t info[8] = {};
-        if (!SafeGetInfo(tex, info, 1))
-        {
-            if (outMode)
-                *outMode = "no_info";
+        const size_t bytes = src.orig.size();
+        if (bytes < 4 || !src.w || !src.h)
             return false;
-        }
-        const uint32_t w = *reinterpret_cast<uint16_t*>(info + 0);
-        const uint32_t h = *reinterpret_cast<uint16_t*>(info + 2);
-        uint8_t* mip0 = SafeGetMip(tex, 0);
-        if (!mip0 || !w || !h || w > 2048 || h > 2048)
-        {
-            if (outMode)
-                *outMode = "no_mip0";
-            return false;
-        }
-        if (outMode)
-            *outMode = "bgra";
-        const size_t bytes = static_cast<size_t>(w) * static_cast<size_t>(h) * 4u;
-        std::lock_guard<std::mutex> lock(g_texMutex);
-        TexTintCache& st = g_texTint[tex];
-        if (!st.orig.empty() && name && !st.path.empty()
-            && _stricmp(st.path.c_str(), name) != 0)
-        {
-            st = {};
-        }
-        if (st.path.empty() && name)
-            st.path = name;
-        if (st.orig.empty())
-        {
-            st.paletted = false;
-            st.w = w;
-            st.h = h;
-            st.orig.assign(mip0, mip0 + bytes);
-        }
-        if (st.orig.size() < bytes)
-            return false;
-        std::memcpy(mip0, st.orig.data(), bytes);
-        HslBgraBuffer(mip0, static_cast<size_t>(w) * static_cast<size_t>(h), hsl, true, w, h);
+        g_tlsPasteOverlay.bgra = src.orig;
+        HslBgraBuffer(g_tlsPasteOverlay.bgra.data(),
+            static_cast<size_t>(src.w) * static_cast<size_t>(src.h),
+            hsl, true, src.w, src.h);
+        g_tlsPasteOverlay.paletted = false;
+        g_tlsPasteOverlay.w = src.w;
+        g_tlsPasteOverlay.h = src.h;
+        g_tlsPasteOverlay.tex = tex;
+        g_tlsPasteOverlay.active = true;
         return true;
     }
 
-    bool RestoreTextureCacheOrig(void* tex)
+
+    bool RestoreTextureCacheOrig(void* tex, const char* name = nullptr)
     {
         if (!tex)
             return false;
-        std::lock_guard<std::mutex> lock(g_texMutex);
-        auto it = g_texTint.find(tex);
-        if (it == g_texTint.end() || it->second.orig.empty())
-            return false;
-        TexTintCache& st = it->second;
-        if (st.paletted)
+        TexTintCache st{};
+        bool have = false;
         {
-            uint8_t* pal = SafeGetPal(tex);
-            if (!pal || st.orig.size() < 256 * 4)
-                return false;
-            std::memcpy(pal, st.orig.data(), 256 * 4);
-            return true;
+            std::lock_guard<std::mutex> lock(g_texMutex);
+            auto it = g_texTint.find(tex);
+            if (it != g_texTint.end() && !it->second.orig.empty())
+            {
+                st = it->second;
+                have = true;
+            }
+            else if (name && name[0])
+            {
+                auto pit = g_pathOrig.find(TexPathKey(name));
+                if (pit != g_pathOrig.end() && !pit->second.orig.empty())
+                {
+                    st = pit->second;
+                    g_texTint[tex] = st;
+                    have = true;
+                }
+            }
         }
-        uint8_t* mip0 = SafeGetMip(tex, 0);
-        if (!mip0 || st.orig.empty())
+        if (!have)
             return false;
-        std::memcpy(mip0, st.orig.data(), st.orig.size());
-        return true;
+        return WriteCacheOrigToTex(tex, st);
     }
 
-    bool SlotMatchesLivePaste(int wantSlot, int pasteSlot)
-    {
-        if (wantSlot < 0)
-            return true;
-        if (pasteSlot == wantSlot)
-            return true;
-        // Shirt/chest only — never pull sleeves (8) or gloves into chest replay.
-        if ((wantSlot == 4 || wantSlot == 3) && (pasteSlot == 4 || pasteSlot == 3))
-            return true;
-        return false;
-    }
 
     bool SafeCallPaste(wxl::offsets::engine::gx::CharPasteToSectionFn fn,
                        int section, void* src, void* dst) noexcept
@@ -2514,90 +4127,22 @@ namespace
         }
     }
 
-    void ReplayLivePastesForSlot(int slot)
-    {
-        // Body sections are multi-layer (pant+belt, bracer+glove_al, pant_ll+boot_ll).
-        // Replaying only the changed slot left other layers missing → wrong texture
-        // appearing in that section. Always rebuild the full ordered paste list.
-        const bool bodySlot = (slot < 0)
-            || slot == 3 || slot == 4 || slot == 5
-            || slot == 6 || slot == 7 || slot == 8 || slot == 9;
-        if (!bodySlot)
-            return;
-
-        // Replay runs outside RenderPrep — force-allow so tint applies, then restore
-        // TextureCache so world units never see our modified shared sources.
-        std::lock_guard<std::recursive_mutex> gate(g_pasteGateMu);
-        void* pm = LocalPlayerBodyModel();
-        if (!pm)
-            pm = ComponentModel(g_localPlayerComponent.load(std::memory_order_relaxed));
-        g_prepModel.store(pm, std::memory_order_relaxed);
-        g_forceAllowPaste.store(true, std::memory_order_relaxed);
-
-        LivePaste copy[kMaxLivePastes];
-        int n = 0;
-        {
-            std::lock_guard<std::mutex> lock(g_livePasteMu);
-            for (int i = 0; i < g_livePasteN; ++i)
-                copy[n++] = g_livePastes[i];
-        }
-
-        int ok = 0;
-        int fail = 0;
-        for (int i = 0; i < n; ++i)
-        {
-            // Skin layout (-2): paste untinted to reset the section base.
-            if (copy[i].slot == -2)
-            {
-                if (SafeCallPaste(g_origPasteToSection, copy[i].section, copy[i].src, copy[i].dst))
-                    ++ok;
-                else
-                    ++fail;
-                continue;
-            }
-
-            const char* name = TextureName(copy[i].src);
-            SlotHsl hsl{};
-            int mapped = -1;
-            const bool has = name && TryHslForComponentTexture(name, hsl, &mapped);
-            RestoreTextureCacheOrig(copy[i].src);
-            if (has)
-                TintTextureCacheForPaste(copy[i].src, name, hsl, mapped, nullptr);
-
-            if (SafeCallPaste(g_origPasteFromSkin, copy[i].section, copy[i].src, copy[i].dst))
-                ++ok;
-            else
-                ++fail;
-
-            // Unconditional restore after every tinted replay paste.
-            RestoreTextureCacheOrig(copy[i].src);
-        }
-
-        g_forceAllowPaste.store(false, std::memory_order_relaxed);
-        g_assemblingAllowed.store(false, std::memory_order_relaxed);
-        g_prepModel.store(nullptr, std::memory_order_relaxed);
-    }
 
     void __cdecl hkPasteSkinLayout(int section, void* srcTexture, void* dstMips)
     {
         // 0x4F07D0: base skin laid into every body section — NEVER tint here.
-        // Only track layers while assembling the local player / DressUp preview.
         std::lock_guard<std::recursive_mutex> gate(g_pasteGateMu);
-        if (srcTexture && dstMips && IsPasteTintAllowed())
-            RememberLivePaste(section, srcTexture, dstMips, -2);
         if (g_origPasteToSection)
-            g_origPasteToSection(section, srcTexture, dstMips);
+            SafeCallPaste(g_origPasteToSection, section, srcTexture, dstMips);
     }
 
     void __cdecl hkPasteToSection(int section, void* srcTexture, void* dstMips)
     {
-        // 0x4F08A0: items / face / hair overlays — tint TextureComponents only for
-        // the local player (or armed DressUp preview). Always restore the shared
-        // TextureCache after paste so other characters never inherit our palette.
+        // 0x4F08A0: item TextureComponents pasted into one composite layer.
         std::lock_guard<std::recursive_mutex> gate(g_pasteGateMu);
-        const bool allow = IsPasteTintAllowed();
-        bool didTint = false;
-        const char* tintName = nullptr;
+        bool allow = IsPasteTintAllowed();
+        OwnerGuid effectiveOwner = CanonicalTintOwner(
+            g_prepOwnerGuid.load(std::memory_order_relaxed));
         if (srcTexture)
         {
             const char* name = TextureName(srcTexture);
@@ -2605,65 +4150,134 @@ namespace
             {
                 SlotHsl hsl{};
                 int slot = -1;
-                const bool hasHsl = TryHslForComponentTexture(name, hsl, &slot);
-                if (slot < 0)
-                    slot = SlotForComponentTexture(name);
-                if (allow && slot >= 0)
+                bool hasHsl = TryHslForComponentTexture(name, section, hsl, &slot);
+                bool orphanTint = false;
+                if (!hasHsl && ResolveOrphanPasteOwner(name, section, effectiveOwner, hsl, slot))
                 {
-                    RememberLivePaste(section, srcTexture, dstMips, slot);
-                    // Catch bank must match /recolor: only local-player pastes.
-                    // DressUp / transmog preview rebuilds must NOT overwrite the sample
-                    // (last-write would make Tints Catch ≠ /recolor Catch for the same slot).
-                    void* prep = g_prepModel.load(std::memory_order_relaxed);
-                    void* pm = LocalPlayerBodyModel();
-                    const bool playerCatch = (pm && prep == pm)
-                        || (!pm); // char-select / no world player: keep prior behavior
-                    if (playerCatch)
-                        CaptureCatchFromTextureCache(srcTexture, slot, name);
+                    hasHsl = true;
+                    orphanTint = !allow;
+                    if (orphanTint)
+                        allow = true;
                 }
-                if (allow && hasHsl)
+                else if (hasHsl && effectiveOwner == 0)
+                    effectiveOwner = CanonicalTintOwner(
+                        g_prepOwnerGuid.load(std::memory_order_relaxed));
+
+                const OwnerGuid self = ActiveOwnerGuid();
+                const uint32_t equipEntry = (slot >= 0)
+                    ? EquipSnapEntry(effectiveOwner, slot) : 0;
+                const int equipKnown = EquipSnapKnown(effectiveOwner) ? 1 : 0;
+                const bool isSelf = self != 0 && GuidSamePlayer(effectiveOwner, self);
+
+                // Body tint requires stem match (hasHsl) AND known equip with item present.
+                const bool emptySlot = slot >= 0 && equipKnown && equipEntry == 0;
+                const bool remoteNoItem = !isSelf && slot >= 0 && equipEntry == 0;
+                const bool doTint = allow && hasHsl && slot >= 0 && effectiveOwner != 0
+                    && equipKnown && !emptySlot && !remoteNoItem;
+                bool pathOk = false;
+
+                // #region agent log
+                if (!isSelf && g_dbgPasteRemoteN.fetch_add(1, std::memory_order_relaxed) < 80)
                 {
-                    const bool ok = TintTextureCacheForPaste(srcTexture, name, hsl, slot, nullptr);
-                    didTint = ok;
-                    tintName = name;
-                    if (ok && !g_forceAllowPaste.load(std::memory_order_relaxed))
-                        g_naturalTintPastes.fetch_add(1, std::memory_order_relaxed);
+                    char stem[kStemCap] = {};
+                    DbgTexBasename615(name, stem, sizeof(stem));
+                    const int suspicious = (ContainsCI(name, "head") || ContainsCI(name, "face")
+                        || ContainsCI(name, "hair") || ContainsCI(name, "skin")
+                        || section <= 2) ? 1 : 0;
+                    const char* msg = doTint ? "remote_tint"
+                        : (hasHsl ? "remote_skip" : "remote_no_hsl");
+                    if (orphanTint && doTint)
+                        msg = "orphan_tint";
+                    else if (orphanTint && hasHsl && !doTint)
+                        msg = "orphan_skip";
+                    DbgLog615(doTint ? "H1" : (hasHsl ? "H4" : "H2"),
+                        "hkPasteToSection", msg,
+                        static_cast<unsigned long long>(effectiveOwner), slot, section, stem,
+                        static_cast<int>(equipEntry), suspicious,
+                        reinterpret_cast<uintptr_t>(srcTexture));
+                }
+                // #endregion
+
+                if (doTint)
+                {
+                    struct OrphanPasteScope
+                    {
+                        bool active = false;
+                        OwnerGuid prevOwner = 0;
+                        void* prevModel = nullptr;
+                        bool prevAssembling = false;
+                        bool prevForce = false;
+                        OwnerGuid prevForceOwner = 0;
+
+                        void Enter(OwnerGuid owner)
+                        {
+                            if (!owner)
+                                return;
+                            prevOwner = g_prepOwnerGuid.exchange(owner, std::memory_order_relaxed);
+                            prevModel = g_prepModel.exchange(
+                                OwnerBodyModel(owner), std::memory_order_relaxed);
+                            prevAssembling = g_assemblingAllowed.exchange(
+                                true, std::memory_order_relaxed);
+                            prevForce = g_forceAllowPaste.exchange(
+                                true, std::memory_order_relaxed);
+                            prevForceOwner = g_forceOwnerGuid.exchange(
+                                owner, std::memory_order_relaxed);
+                            active = true;
+                        }
+
+                        ~OrphanPasteScope()
+                        {
+                            if (!active)
+                                return;
+                            g_prepOwnerGuid.store(prevOwner, std::memory_order_relaxed);
+                            g_prepModel.store(prevModel, std::memory_order_relaxed);
+                            g_assemblingAllowed.store(prevAssembling, std::memory_order_relaxed);
+                            g_forceAllowPaste.store(prevForce, std::memory_order_relaxed);
+                            g_forceOwnerGuid.store(prevForceOwner, std::memory_order_relaxed);
+                        }
+                    } orphanScope;
+                    if (orphanTint)
+                        orphanScope.Enter(effectiveOwner);
+
+                    pathOk = CapturePathOrigForOverlay(srcTexture, name);
+                    const bool ok = pathOk && ArmPasteTintOverlay(srcTexture, name, hsl);
+                    // #region agent log
+                    if (!isSelf && ok
+                        && g_dbgPasteRemoteN.load(std::memory_order_relaxed) < 100)
+                    {
+                        char stem[kStemCap] = {};
+                        DbgTexBasename615(name, stem, sizeof(stem));
+                        DbgLog615("H5", "hkPasteToSection", "overlay_ok",
+                            static_cast<unsigned long long>(effectiveOwner), slot, section, stem,
+                            pathOk ? 1 : 0, hsl.mode,
+                            reinterpret_cast<uintptr_t>(srcTexture));
+                    }
+                    // #endregion
+                    if (ok)
+                    {
+                        SafeCallPaste(g_origPasteFromSkin, section, srcTexture, dstMips);
+                        ClearPasteTintOverlay();
+                        if (allow)
+                        {
+                            void* prep = g_prepModel.load(std::memory_order_relaxed);
+                            void* pm = LocalPlayerBodyModel();
+                            const bool playerCatch = (pm && prep == pm) || (!pm);
+                            if (playerCatch)
+                                CaptureCatchFromTextureCache(srcTexture, slot, name);
+                        }
+                        return;
+                    }
                 }
             }
+        }
+        if (!srcTexture || !dstMips)
+        {
+            if (g_origPasteFromSkin)
+                SafeCallPaste(g_origPasteFromSkin, section, srcTexture, dstMips);
+            return;
         }
         if (g_origPasteFromSkin)
-            g_origPasteFromSkin(section, srcTexture, dstMips);
-        if (didTint)
-        {
-            const bool restored = RestoreTextureCacheOrig(srcTexture);
-            int mismatch = -1;
-            if (restored && srcTexture)
-            {
-                std::lock_guard<std::mutex> lock(g_texMutex);
-                auto it = g_texTint.find(srcTexture);
-                if (it != g_texTint.end() && !it->second.orig.empty())
-                {
-                    if (it->second.paletted)
-                    {
-                        uint8_t* pal = SafeGetPal(srcTexture);
-                        mismatch = (pal && std::memcmp(pal, it->second.orig.data(),
-                            (std::min)(it->second.orig.size(), size_t{ 256 * 4 })) == 0) ? 0 : 1;
-                    }
-                    else
-                    {
-                        uint8_t* mip0 = SafeGetMip(srcTexture, 0);
-                        mismatch = (mip0 && std::memcmp(mip0, it->second.orig.data(),
-                            it->second.orig.size()) == 0) ? 0 : 1;
-                    }
-                }
-            }
-        }
-    }
-
-    void NotifyOcSlotChanged(int slot)
-    {
-        if (slot == 0 || slot == 2 || slot == 15 || slot == 16 || slot == 17)
-            g_ocPixelTintLive.store(false, std::memory_order_relaxed);
+            SafeCallPaste(g_origPasteFromSkin, section, srcTexture, dstMips);
     }
 
     void SetSlotHsl(int slot, float r, float g, float b)
@@ -2681,178 +4295,27 @@ namespace
         h.stops[0][0] = h.hue;
         h.stops[0][1] = h.sat;
         h.stops[0][2] = h.light;
-        {
-            std::lock_guard<std::mutex> lock(g_colorMutex);
-            g_slotHsl[slot] = h;
-        }
-        NotifyOcSlotChanged(slot);
-        if (g_previewUiActive.load(std::memory_order_relaxed))
-            ArmPreviewCapture(800);
+        WriteLocalSlotHsl(slot, h);
         if (IsBodyEquipSlot(slot))
             RequestBodyRebuildForSlot(slot);
-        SaveHslToDisk();
-    }
-
-    void SetSlotDraftSolid(int slot, float r, float g, float b)
-    {
-        if (slot < 0 || slot >= kMaxEquipSlots)
-            return;
-        SlotHsl h{};
-        h.active = true;
-        h.mode = 0;
-        h.stopCount = 1;
-        h.gradFill = 0;
-        h.hue = Clamp01(r);
-        h.sat = Clamp01(g);
-        h.light = Clamp01(b);
-        h.stops[0][0] = h.hue;
-        h.stops[0][1] = h.sat;
-        h.stops[0][2] = h.light;
-        {
-            std::lock_guard<std::mutex> lock(g_colorMutex);
-            g_draftHsl[slot] = h;
-        }
-        NotifyOcSlotChanged(slot);
-        if (g_previewUiActive.load(std::memory_order_relaxed))
-            ArmPreviewCapture(800);
-        if (IsBodyEquipSlot(slot))
-            ForcePreviewOnlyRebuildForSlot(slot);
-    }
-
-    void SetSlotDraftGradient(int slot, int nStops, int fill, const float* colors, int colorFloats)
-    {
-        if (slot < 0 || slot >= kMaxEquipSlots || !colors)
-            return;
-        if (nStops != 2 && nStops != 3 && nStops != 5)
-            nStops = 3;
-        SlotHsl h{};
-        h.active = true;
-        h.mode = 2;
-        h.stopCount = static_cast<uint8_t>(nStops);
-        h.gradFill = (fill != 0) ? 1 : 0;
-        if (h.gradFill == 0)
-        {
-            if (colorFloats < 3)
-                return;
-            h.hue = Clamp01(colors[0]);
-            h.sat = Clamp01(colors[1]);
-            h.light = Clamp01(colors[2]);
-        }
-        else
-        {
-            if (colorFloats < nStops * 3)
-                return;
-            for (int s = 0; s < nStops; ++s)
-            {
-                h.stops[s][0] = Clamp01(colors[s * 3 + 0]);
-                h.stops[s][1] = Clamp01(colors[s * 3 + 1]);
-                h.stops[s][2] = Clamp01(colors[s * 3 + 2]);
-            }
-        }
-        ResolveSolidStops(h);
-        {
-            std::lock_guard<std::mutex> lock(g_colorMutex);
-            g_draftHsl[slot] = h;
-        }
-        NotifyOcSlotChanged(slot);
-        if (g_previewUiActive.load(std::memory_order_relaxed))
-            ArmPreviewCapture(800);
-        if (IsBodyEquipSlot(slot))
-            ForcePreviewOnlyRebuildForSlot(slot);
-    }
-
-    // Selective draft: paperdoll/DressUp only until ApplyDraft commits to g_slotHsl.
-    void SetSlotDraftSelective(int slot, const SelRule* rules, int ruleCount)
-    {
-        if (slot < 0 || slot >= kMaxEquipSlots)
-            return;
-        if (!rules || ruleCount <= 0)
-        {
-            {
-                std::lock_guard<std::mutex> lock(g_colorMutex);
-                g_draftHsl[slot] = {};
-            }
-            NotifyOcSlotChanged(slot);
-            if (g_previewUiActive.load(std::memory_order_relaxed))
-                ArmPreviewCapture(800);
-            if (IsBodyEquipSlot(slot))
-                ForcePreviewOnlyRebuildForSlot(slot);
-            return;
-        }
-        SlotHsl h{};
-        h.active = true;
-        h.mode = 1;
-        const int n = (std::min)(ruleCount, kMaxSelRules);
-        h.ruleCount = static_cast<uint8_t>(n);
-        for (int i = 0; i < n; ++i)
-        {
-            SelRule r = rules[i];
-            r.sr = Clamp01(r.sr);
-            r.sg = Clamp01(r.sg);
-            r.sb = Clamp01(r.sb);
-            r.dr = Clamp01(r.dr);
-            r.dg = Clamp01(r.dg);
-            r.db = Clamp01(r.db);
-            r.tol = Clamp01(r.tol);
-            if (r.tol < 0.02f)
-                r.tol = 0.35f;
-            h.rules[i] = r;
-        }
-        SyncSlotMirrorsFromLastRule(h);
-        {
-            std::lock_guard<std::mutex> lock(g_colorMutex);
-            g_draftHsl[slot] = h;
-        }
-        NotifyOcSlotChanged(slot);
-        if (g_previewUiActive.load(std::memory_order_relaxed))
-            ArmPreviewCapture(800);
-        if (IsBodyEquipSlot(slot))
-            ForcePreviewOnlyRebuildForSlot(slot);
-    }
-
-    void ApplySlotDraft(int slot)
-    {
-        if (slot < 0 || slot >= kMaxEquipSlots)
-            return;
-        SlotHsl h{};
-        {
-            std::lock_guard<std::mutex> lock(g_colorMutex);
-            if (!g_draftHsl[slot].active)
-                return;
-            h = g_draftHsl[slot];
-            g_slotHsl[slot] = h;
-            g_draftHsl[slot] = {};
-        }
-        NotifyOcSlotChanged(slot);
-        if (g_previewUiActive.load(std::memory_order_relaxed))
-            ArmPreviewCapture(800);
-        if (IsBodyEquipSlot(slot))
-            RequestBodyRebuildForSlot(slot);
-        else
-            ForcePreviewOnlyRebuildForSlot(slot);
-        SaveHslToDisk();
+        SaveLocalHslIfCommitted();
     }
 
     void ResetSlotTint(int slot)
     {
         if (slot < 0 || slot >= kMaxEquipSlots)
             return;
+        ClearDraftSlot(slot);
         {
             std::lock_guard<std::mutex> lock(g_colorMutex);
             g_slotHsl[slot] = {};
-            g_draftHsl[slot] = {};
         }
-        NotifyOcSlotChanged(slot);
-        if (g_previewUiActive.load(std::memory_order_relaxed))
-            ArmPreviewCapture(800);
         if (IsBodyEquipSlot(slot))
             RequestBodyRebuildForSlot(slot);
-        else
-            ForcePreviewOnlyRebuildForSlot(slot);
-        SaveHslToDisk();
+        SaveLocalHslIfCommitted();
     }
 
-    // nStops: 2, 3, or 5. fill: 0=auto from colors[0], 1=custom colors[0..nStops).
+    // nStops: 2, 3, or 5.
     // colors layout: RGB triples packed flat (max 5*3).
     void SetSlotGradient(int slot, int nStops, int fill, const float* colors, int colorFloats)
     {
@@ -2885,16 +4348,10 @@ namespace
             }
         }
         ResolveSolidStops(h);
-        {
-            std::lock_guard<std::mutex> lock(g_colorMutex);
-            g_slotHsl[slot] = h;
-        }
-        NotifyOcSlotChanged(slot);
-        if (g_previewUiActive.load(std::memory_order_relaxed))
-            ArmPreviewCapture(800);
+        WriteLocalSlotHsl(slot, h);
         if (IsBodyEquipSlot(slot))
             RequestBodyRebuildForSlot(slot);
-        SaveHslToDisk();
+        SaveLocalHslIfCommitted();
     }
 
     void SetSlotSelective(int slot, float sr, float sg, float sb,
@@ -2916,77 +4373,70 @@ namespace
 
         const char* action = "new";
         SlotHsl h{};
+        ReadLocalSlotHsl(slot, h);
+        // Switching from solid / empty → start a fresh selective chain.
+        if (!h.active || h.mode != 1)
         {
-            std::lock_guard<std::mutex> lock(g_colorMutex);
-            h = g_slotHsl[slot];
-            // Switching from solid / empty → start a fresh selective chain.
-            if (!h.active || h.mode != 1)
-            {
-                h = {};
-                h.active = true;
-                h.mode = 1;
-                h.rules[0] = neu;
-                h.ruleCount = 1;
-                action = "new";
-            }
-            else if (!forceAppend && h.ruleCount > 0 &&
-                SameSelectiveSrc(h.rules[h.ruleCount - 1], neu.sr, neu.sg, neu.sb))
-            {
-                // Same source as last rule → only update destination / tol.
-                h.rules[h.ruleCount - 1] = neu;
-                action = "update_last";
-            }
-            else if (h.ruleCount < kMaxSelRules)
-            {
-                h.rules[h.ruleCount++] = neu;
-                action = forceAppend ? "force_append" : "append";
-            }
-            else
-            {
-                // Drop oldest, append newest (max 4 chained replaces).
-                for (int i = 0; i < kMaxSelRules - 1; ++i)
-                    h.rules[i] = h.rules[i + 1];
-                h.rules[kMaxSelRules - 1] = neu;
-                h.ruleCount = kMaxSelRules;
-                action = "shift_append";
-            }
-            SyncSlotMirrorsFromLastRule(h);
-            g_slotHsl[slot] = h;
+            h = {};
+            h.active = true;
+            h.mode = 1;
+            h.rules[0] = neu;
+            h.ruleCount = 1;
+            action = "new";
         }
-        NotifyOcSlotChanged(slot);
-        if (g_previewUiActive.load(std::memory_order_relaxed))
-            ArmPreviewCapture(800);
+        else if (!forceAppend && h.ruleCount > 0 &&
+            SameSelectiveSrc(h.rules[h.ruleCount - 1], neu.sr, neu.sg, neu.sb))
+        {
+            h.rules[h.ruleCount - 1] = neu;
+            action = "update_last";
+        }
+        else if (h.ruleCount < kMaxSelRules)
+        {
+            h.rules[h.ruleCount++] = neu;
+            action = forceAppend ? "force_append" : "append";
+        }
+        else
+        {
+            for (int i = 0; i < kMaxSelRules - 1; ++i)
+                h.rules[i] = h.rules[i + 1];
+            h.rules[kMaxSelRules - 1] = neu;
+            h.ruleCount = kMaxSelRules;
+            action = "shift_append";
+        }
+        SyncSlotMirrorsFromLastRule(h);
+        (void)action;
+        WriteLocalSlotHsl(slot, h);
         if (IsBodyEquipSlot(slot))
             RequestBodyRebuildForSlot(slot);
-        SaveHslToDisk();
+        SaveLocalHslIfCommitted();
     }
 
     void ClearSlotHsl(int slot)
     {
         if (slot < 0 || slot >= kMaxEquipSlots)
             return;
+        ClearDraftSlot(slot);
         {
             std::lock_guard<std::mutex> lock(g_colorMutex);
             g_slotHsl[slot] = {};
         }
-        NotifyOcSlotChanged(slot);
-        if (g_previewUiActive.load(std::memory_order_relaxed))
-            ArmPreviewCapture(800);
         if (IsBodyEquipSlot(slot))
             RequestBodyRebuildForSlot(slot);
-        SaveHslToDisk();
+        SaveLocalHslIfCommitted();
     }
 
     void ClearAllHsl()
     {
+        ClearAllDrafts();
         {
             std::lock_guard<std::mutex> lock(g_colorMutex);
             for (int i = 0; i < kMaxEquipSlots; ++i)
                 g_slotHsl[i] = {};
         }
-        g_ocPixelTintLive.store(false, std::memory_order_relaxed);
-        RequestBodyRebuildForSlot(-1);
-        SaveHslToDisk();
+        // Do NOT RequestBodyRebuildForSlot(-1) — full 0x3FF rebuild on login
+        // (SetSelfGuid) re-pastes the entire body and bugs composites. Per-slot
+        // ApplyLocalPayload / SetSlot rebuilds only the sections that need it.
+        SaveLocalHslIfCommitted();
     }
 
     // Solid OC PS — single color (byte-stable lighting path).
@@ -3397,10 +4847,23 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
             const char* p = name && name[0] ? name : (st.path.empty() ? nullptr : st.path.c_str());
             if (!p)
                 return;
+            DisplaySlotInfo dinfo{};
+            const OwnerGuid self = ActiveOwnerGuid();
+            const bool stemOk = self && GetDisplaySlotInfo(self, slot, dinfo)
+                && DisplaySlotHasComponentTextures(dinfo) && PathMatchesAnyStem(p, dinfo);
+            // Preview bake: prefer ItemDisplayInfo component stems; folder heuristic only
+            // when stems are unknown (UI swatch, not in-world paste tint).
             const int mapped = SlotForComponentTexture(p);
-            if (mapped != slot && !SlotMatchesLivePaste(slot, mapped))
-                return;
+            if (!stemOk)
+            {
+                if (DisplaySlotHasComponentTextures(dinfo))
+                    return; // display known but this BLP is not this slot's item
+                if (mapped != slot)
+                    return;
+            }
             int score = ScoreTexPathForSlot(p, slot);
+            if (stemOk)
+                score += 40;
             if (mapped == slot)
                 score += 5;
             if (score > bestScore)
@@ -3411,19 +4874,6 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
                 bestPath = p;
             }
         };
-
-        {
-            std::lock_guard<std::mutex> lock(g_livePasteMu);
-            for (int i = 0; i < g_livePasteN; ++i)
-            {
-                void* tex = g_livePastes[i].src;
-                const char* name = TextureName(tex);
-                std::lock_guard<std::mutex> tlock(g_texMutex);
-                auto it = g_texTint.find(tex);
-                if (it != g_texTint.end())
-                    consider(tex, name, it->second);
-            }
-        }
         {
             std::lock_guard<std::mutex> tlock(g_texMutex);
             for (auto& kv : g_texTint)
@@ -3449,12 +4899,23 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
         }
 
         std::lock_guard<std::mutex> tlock(g_texMutex);
+        DisplaySlotInfo dinfo{};
+        const OwnerGuid self = ActiveOwnerGuid();
+        const bool haveStems = self && GetDisplaySlotInfo(self, slot, dinfo)
+            && DisplaySlotHasComponentTextures(dinfo);
         for (auto& kv : g_texNames)
         {
             if (!IsItemComponentTexture(kv.second.c_str()))
                 continue;
-            if (SlotForComponentTexture(kv.second.c_str()) != slot)
+            if (haveStems)
+            {
+                if (!PathMatchesAnyStem(kv.second.c_str(), dinfo))
+                    continue;
+            }
+            else if (SlotForComponentTexture(kv.second.c_str()) != slot)
+            {
                 continue;
+            }
             outPath = kv.second;
             return false;
         }
@@ -3582,6 +5043,10 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
         if (buckets.empty())
         {
             std::vector<std::string> paths;
+            DisplaySlotInfo dinfo{};
+            const OwnerGuid self = ActiveOwnerGuid();
+            const bool haveStems = self && GetDisplaySlotInfo(self, slot, dinfo)
+                && DisplaySlotHasComponentTextures(dinfo);
             {
                 std::lock_guard<std::mutex> lock(g_texMutex);
                 for (auto& kv : g_texNames)
@@ -3589,9 +5054,15 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
                     const char* p = kv.second.c_str();
                     if (!IsItemComponentTexture(p))
                         continue;
-                    const int mapped = SlotForComponentTexture(p);
-                    if (!SlotMatchesLivePaste(slot, mapped))
+                    if (haveStems)
+                    {
+                        if (!PathMatchesAnyStem(p, dinfo))
+                            continue;
+                    }
+                    else if (SlotForComponentTexture(p) != slot)
+                    {
                         continue;
+                    }
                     paths.push_back(kv.second);
                 }
             }
@@ -3788,8 +5259,6 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
         return 1;
     }
 
-    // WXL_RecolorSetSlotSelectiveDraft(slot, nRules [, sr,sg,sb, dr,dg,db, tol]...)
-    // nRules=0 clears the selective draft for preview.
     int __cdecl LuaRecolorSetSlotSelectiveDraft(void* state)
     {
         if (!state || wlua::GetTop(state) < 2)
@@ -3995,60 +5464,354 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
         return 0;
     }
 
+    int __cdecl LuaRecolorApplyOwnerTint(void* state)
+    {
+        // WXL_RecolorApplyOwnerTint(ownerGuid, slot, "clear"|mode, [data])
+        // Unified self + remote write path (same mental model).
+        try
+        {
+            if (!state || wlua::GetTop(state) < 3)
+                return 0;
+            const char* guidStr = wlua::ToString(state, 1, nullptr);
+            const int slot = static_cast<int>(wlua::ToNumber(state, 2));
+            OwnerGuid owner = 0;
+            if (!ParseGuidString(guidStr, owner) || slot < 0 || slot >= kMaxEquipSlots)
+            {
+                wlua::PushBoolean(state, 0);
+                return 1;
+            }
+            const char* modeOrClear = wlua::ToString(state, 3, nullptr);
+            if (!modeOrClear)
+            {
+                wlua::PushBoolean(state, 0);
+                return 1;
+            }
+            if (_stricmp(modeOrClear, "clear") == 0)
+            {
+                const bool ok = ApplyOwnerTint(owner, slot, nullptr);
+                wlua::PushBoolean(state, ok ? 1 : 0);
+                return 1;
+            }
+            if (wlua::GetTop(state) < 4)
+            {
+                wlua::PushBoolean(state, 0);
+                return 1;
+            }
+            const int mode = static_cast<int>(wlua::ToNumber(state, 3));
+            const char* data = wlua::ToString(state, 4, nullptr);
+            SlotHsl h{};
+            if (mode < 0 || mode > 2 || !data
+                || !ParseTintData(static_cast<uint8_t>(mode), data, h))
+            {
+                wlua::PushBoolean(state, 0);
+                return 1;
+            }
+            const bool ok = ApplyOwnerTint(owner, slot, &h);
+            wlua::PushBoolean(state, ok ? 1 : 0);
+            return 1;
+        }
+        catch (...)
+        {
+            if (state)
+            {
+                wlua::PushBoolean(state, 0);
+                return 1;
+            }
+            return 0;
+        }
+    }
+
+    int __cdecl LuaRecolorSetRemote(void* state)
+    {
+        // Compat wrapper → ApplyOwnerTint (never skips self; Apply routes correctly).
+        try
+        {
+            if (!state || wlua::GetTop(state) < 4)
+                return 0;
+            const char* guidStr = wlua::ToString(state, 1, nullptr);
+            const int slot = static_cast<int>(wlua::ToNumber(state, 2));
+            const int mode = static_cast<int>(wlua::ToNumber(state, 3));
+            const char* data = wlua::ToString(state, 4, nullptr);
+            OwnerGuid owner = 0;
+            if (!ParseGuidString(guidStr, owner) || slot < 0 || slot >= kMaxEquipSlots
+                || mode < 0 || mode > 2 || !data)
+            {
+                wlua::PushBoolean(state, 0);
+                return 1;
+            }
+            SlotHsl h{};
+            if (!ParseTintData(static_cast<uint8_t>(mode), data, h))
+            {
+                wlua::PushBoolean(state, 0);
+                return 1;
+            }
+            const bool ok = ApplyOwnerTint(owner, slot, &h);
+            wlua::PushBoolean(state, ok ? 1 : 0);
+            return 1;
+        }
+        catch (...)
+        {
+            if (state)
+            {
+                wlua::PushBoolean(state, 0);
+                return 1;
+            }
+            return 0;
+        }
+    }
+
+    // Compat: apply server PUSH to local slot table without GUID arg.
+    int __cdecl LuaRecolorApplyLocalPayload(void* state)
+    {
+        try
+        {
+            if (!state || wlua::GetTop(state) < 2)
+                return 0;
+            const int slot = static_cast<int>(wlua::ToNumber(state, 1));
+            if (slot < 0 || slot >= kMaxEquipSlots)
+            {
+                wlua::PushBoolean(state, 0);
+                return 1;
+            }
+            OwnerGuid self = ActiveOwnerGuid();
+            if (!self)
+            {
+                wlua::PushBoolean(state, 0);
+                return 1;
+            }
+            const char* modeOrClear = wlua::ToString(state, 2, nullptr);
+            if (!modeOrClear)
+            {
+                wlua::PushBoolean(state, 0);
+                return 1;
+            }
+            if (_stricmp(modeOrClear, "clear") == 0)
+            {
+                const bool ok = ApplyOwnerTint(self, slot, nullptr);
+                wlua::PushBoolean(state, ok ? 1 : 0);
+                return 1;
+            }
+            if (wlua::GetTop(state) < 3)
+            {
+                wlua::PushBoolean(state, 0);
+                return 1;
+            }
+            const int mode = static_cast<int>(wlua::ToNumber(state, 2));
+            const char* data = wlua::ToString(state, 3, nullptr);
+            SlotHsl h{};
+            if (mode < 0 || mode > 2 || !data
+                || !ParseTintData(static_cast<uint8_t>(mode), data, h))
+            {
+                wlua::PushBoolean(state, 0);
+                return 1;
+            }
+            const bool ok = ApplyOwnerTint(self, slot, &h);
+            wlua::PushBoolean(state, ok ? 1 : 0);
+            return 1;
+        }
+        catch (...)
+        {
+            if (state)
+            {
+                wlua::PushBoolean(state, 0);
+                return 1;
+            }
+            return 0;
+        }
+    }
+
+    int __cdecl LuaRecolorSetSelfGuid(void* state)
+    {
+        if (!state || wlua::GetTop(state) < 1)
+            return 0;
+        const char* guidStr = wlua::ToString(state, 1, nullptr);
+        OwnerGuid owner = 0;
+        if (!ParseGuidString(guidStr, owner) || !owner)
+        {
+            wlua::PushBoolean(state, 0);
+            return 1;
+        }
+        g_cachedSelfGuid.store(owner, std::memory_order_relaxed);
+        // Server PushAllEquipped is source of truth — clear stale local slots.
+        ClearAllHsl();
+        wlua::PushBoolean(state, 1);
+        return 1;
+    }
+
+    int __cdecl LuaRecolorBeginEquipSnap(void* state)
+    {
+        // Only refresh LOCAL equip snap. Remotes are filled from server PUSH
+        // entry — GetInventoryItemID on other units returns 0 here and was
+        // wiping real entries → every remote slot flagged phantom (feet etc.).
+        {
+            std::lock_guard<std::mutex> lock(g_equipSnapMu);
+            const OwnerGuid self = ActiveOwnerGuid();
+            if (self)
+                g_equipSnap.erase(self);
+            else
+                g_equipSnap.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_displayMu);
+            const OwnerGuid self = ActiveOwnerGuid();
+            if (self)
+                g_displaySnap.erase(self);
+            else
+                g_displaySnap.clear();
+        }
+        if (state)
+        {
+            wlua::PushBoolean(state, 1);
+            return 1;
+        }
+        return 0;
+    }
+
+    int __cdecl LuaRecolorNoteEquip(void* state)
+    {
+        // WXL_RecolorNoteEquip(ownerGuid, slot, entry)
+        // Marks owner as "equipKnown". entry=0 means slot empty.
+        if (!state || wlua::GetTop(state) < 3)
+            return 0;
+        const char* guidStr = wlua::ToString(state, 1, nullptr);
+        const int slot = static_cast<int>(wlua::ToNumber(state, 2));
+        const uint32_t entry = static_cast<uint32_t>(wlua::ToNumber(state, 3));
+        OwnerGuid owner = 0;
+        if (!ParseGuidString(guidStr, owner) || slot < 0 || slot >= kMaxEquipSlots)
+        {
+            wlua::PushBoolean(state, 0);
+            return 1;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_equipSnapMu);
+            g_equipSnap[owner][static_cast<size_t>(slot)] = entry;
+        }
+        SetDisplaySlotFromItemEntry(owner, slot, entry);
+        const OwnerGuid self = ActiveOwnerGuid();
+
+        // #region agent log
+        {
+            const bool isRemote = self != 0 && !GuidSamePlayer(owner, self);
+            if (isRemote && g_dbgNoteEquipN.fetch_add(1, std::memory_order_relaxed) < 40)
+            {
+                DisplaySlotInfo di{};
+                uint32_t dispId = 0;
+                if (GetDisplaySlotInfo(owner, slot, di))
+                    dispId = di.displayId;
+                DbgLog615("H4", "LuaRecolorNoteEquip", "remote_snap",
+                    static_cast<unsigned long long>(owner), slot, 0, "",
+                    static_cast<int>(entry), static_cast<int>(dispId), 0);
+            }
+        }
+        // #endregion
+
+        if (self && GuidSamePlayer(owner, self))
+        {
+            // Unequip OR item swap: drop stale paste refs for this slot.
+            ClearCatchSampleForSlot(slot);
+            if (entry == 0 && IsBodyEquipSlot(slot))
+                RequestBodyRebuildForSlot(slot);
+        }
+        // Remote tint clear on unequip is handled by applyPush → ApplyOwnerTint
+        // (deferred). Do NOT ClearRemoteSlotTint here — transmog visible-slot
+        // flicker sends NoteEquip(0) for every slot and was wiping live tints.
+        wlua::PushBoolean(state, 1);
+        return 1;
+    }
+
+    int __cdecl LuaRecolorClearRemote(void* state)
+    {
+        try
+        {
+            if (!state || wlua::GetTop(state) < 1)
+                return 0;
+            const char* guidStr = wlua::ToString(state, 1, nullptr);
+            OwnerGuid owner = 0;
+            if (!ParseGuidString(guidStr, owner))
+            {
+                wlua::PushBoolean(state, 0);
+                return 1;
+            }
+            const int top = wlua::GetTop(state);
+            const int slot = (top >= 2) ? static_cast<int>(wlua::ToNumber(state, 2)) : -1;
+            if (slot >= 0 && slot < kMaxEquipSlots)
+            {
+                ApplyOwnerTint(owner, slot, nullptr);
+            }
+            else
+            {
+                // Clear-all: Force per body slot that had tint — never OR into 255.
+                OwnerSlotHsl before{};
+                {
+                    std::lock_guard<std::mutex> lock(g_remoteMu);
+                    auto it = g_remoteTints.find(owner);
+                    if (it != g_remoteTints.end())
+                        before = it->second;
+                }
+                ClearRemoteSlotTint(owner, -1);
+                for (int s = 0; s < kMaxEquipSlots; ++s)
+                {
+                    if (!before[static_cast<size_t>(s)].active)
+                        continue;
+                    const uint32_t m = SectionMaskForEquipSlot(s);
+                    if (m)
+                        DirtyOwnerSections(owner, m);
+                }
+            }
+            wlua::PushBoolean(state, 1);
+            return 1;
+        }
+        catch (...)
+        {
+            if (state)
+            {
+                wlua::PushBoolean(state, 0);
+                return 1;
+            }
+            return 0;
+        }
+    }
+
+    int __cdecl LuaRecolorClearAllRemote(void* state)
+    {
+        ClearAllRemoteTints();
+        if (state)
+        {
+            wlua::PushBoolean(state, 1);
+            return 1;
+        }
+        return 0;
+    }
+
+    int __cdecl LuaRecolorGetSlotPayload(void* state)
+    {
+        if (!state || wlua::GetTop(state) < 1)
+            return 0;
+        const int slot = static_cast<int>(wlua::ToNumber(state, 1));
+        SlotHsl h{};
+        if (!TrySlotHslCommittedOrDraft(slot, h) || !h.active)
+        {
+            wlua::PushBoolean(state, 0);
+            return 1;
+        }
+        char data[384];
+        if (!FormatTintData(h, data, sizeof(data)))
+        {
+            wlua::PushBoolean(state, 0);
+            return 1;
+        }
+        wlua::PushBoolean(state, 1);
+        wlua::PushNumber(state, static_cast<double>(h.mode));
+        wlua::PushString(state, data);
+        return 3;
+    }
+
     int __cdecl LuaRecolorSetPreviewActive(void* state)
     {
         const bool active = state && wlua::ToNumber(state, 1) != 0.0;
         g_previewUiActive.store(active, std::memory_order_relaxed);
         if (!active)
-        {
-            g_previewCaptureUntil.store(0, std::memory_order_relaxed);
-            g_previewModel.store(nullptr, std::memory_order_relaxed);
-            g_previewComponent.store(nullptr, std::memory_order_relaxed);
-        }
-        else
-            ArmPreviewCapture(1500);
-        if (active)
-            ArmUiCapture(1500);
-        if (state)
-        {
-            wlua::PushBoolean(state, 1);
-            return 1;
-        }
-        return 0;
-    }
-
-    int __cdecl LuaRecolorArmPreviewCapture(void* state)
-    {
-        ArmPreviewCapture(800);
-        ArmUiCapture(800);
-        if (state)
-        {
-            wlua::PushBoolean(state, 1);
-            return 1;
-        }
-        return 0;
-    }
-
-    int __cdecl LuaRecolorArmUiCapture(void* state)
-    {
-        ArmUiCapture(2000);
-        g_characterUiActive.store(true, std::memory_order_relaxed);
-        if (state)
-        {
-            wlua::PushBoolean(state, 1);
-            return 1;
-        }
-        return 0;
-    }
-
-    int __cdecl LuaRecolorSetCharacterUiActive(void* state)
-    {
-        const bool active = state && wlua::ToNumber(state, 1) != 0.0;
-        g_characterUiActive.store(active, std::memory_order_relaxed);
-        if (active)
-            ArmUiCapture(2000);
-        else
-            ClearUiOcRoots();
+            ClearAllDrafts();
         if (state)
         {
             wlua::PushBoolean(state, 1);
@@ -4167,21 +5930,27 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
             wlua::RegisterFunction("WXL_RecolorSetSlotDraft", &LuaRecolorSetSlotDraft);
             wlua::RegisterFunction("WXL_RecolorSetSlotGradient", &LuaRecolorSetSlotGradient);
             wlua::RegisterFunction("WXL_RecolorSetSlotGradientDraft", &LuaRecolorSetSlotGradientDraft);
-            wlua::RegisterFunction("WXL_RecolorSetSlotSelectiveDraft", &LuaRecolorSetSlotSelectiveDraft);
-            wlua::RegisterFunction("WXL_RecolorApplyDraft", &LuaRecolorApplyDraft);
             wlua::RegisterFunction("WXL_RecolorResetTint", &LuaRecolorResetTint);
             wlua::RegisterFunction("WXL_RecolorGetSlotGradient", &LuaRecolorGetSlotGradient);
             wlua::RegisterFunction("WXL_RecolorSetSlotSelective", &LuaRecolorSetSlotSelective);
+            wlua::RegisterFunction("WXL_RecolorSetSlotSelectiveDraft", &LuaRecolorSetSlotSelectiveDraft);
+            wlua::RegisterFunction("WXL_RecolorApplyDraft", &LuaRecolorApplyDraft);
             wlua::RegisterFunction("WXL_RecolorCatchSlotColors", &LuaRecolorCatchSlotColors);
             wlua::RegisterFunction("WXL_RecolorGetSlot", &LuaRecolorGetSlot);
             wlua::RegisterFunction("WXL_RecolorGetSlotTexPath", &LuaRecolorGetSlotTexPath);
             wlua::RegisterFunction("WXL_RecolorBakePreview", &LuaRecolorBakePreview);
+            wlua::RegisterFunction("WXL_RecolorSetPreviewActive", &LuaRecolorSetPreviewActive);
             wlua::RegisterFunction("WXL_RecolorClearSlot", &LuaRecolorClearSlot);
             wlua::RegisterFunction("WXL_RecolorClearAll", &LuaRecolorClearAll);
-            wlua::RegisterFunction("WXL_RecolorSetPreviewActive", &LuaRecolorSetPreviewActive);
-            wlua::RegisterFunction("WXL_RecolorArmPreviewCapture", &LuaRecolorArmPreviewCapture);
-            wlua::RegisterFunction("WXL_RecolorArmUiCapture", &LuaRecolorArmUiCapture);
-            wlua::RegisterFunction("WXL_RecolorSetCharacterUiActive", &LuaRecolorSetCharacterUiActive);
+            wlua::RegisterFunction("WXL_RecolorSetRemote", &LuaRecolorSetRemote);
+            wlua::RegisterFunction("WXL_RecolorApplyOwnerTint", &LuaRecolorApplyOwnerTint);
+            wlua::RegisterFunction("WXL_RecolorApplyLocalPayload", &LuaRecolorApplyLocalPayload);
+            wlua::RegisterFunction("WXL_RecolorSetSelfGuid", &LuaRecolorSetSelfGuid);
+            wlua::RegisterFunction("WXL_RecolorBeginEquipSnap", &LuaRecolorBeginEquipSnap);
+            wlua::RegisterFunction("WXL_RecolorNoteEquip", &LuaRecolorNoteEquip);
+            wlua::RegisterFunction("WXL_RecolorClearRemote", &LuaRecolorClearRemote);
+            wlua::RegisterFunction("WXL_RecolorClearAllRemote", &LuaRecolorClearAllRemote);
+            wlua::RegisterFunction("WXL_RecolorGetSlotPayload", &LuaRecolorGetSlotPayload);
             wlua::RegisterFunction("WXL_RecolorForceBodyRebuild", &LuaRecolorForceBodyRebuild);
             wlua::RegisterFunction("WXL_RecolorBeginBatch", &LuaRecolorBeginBatch);
             wlua::RegisterFunction("WXL_RecolorEndBatch", &LuaRecolorEndBatch);
@@ -4190,14 +5959,70 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
             wlua::RegisterFunction("WXL_RecolorCancelScreenSample", &LuaRecolorCancelScreenSample);
             wlua::RegisterFunction("WXL_RecolorGetScreenSample", &LuaRecolorGetScreenSample);
 
-            LoadHslFromDisk();
+            // Do not LoadHslFromDisk here — no self guid yet; shared state file leaked
+            // across dual-client characters. Slots come from server PUSH after SetSelfGuid.
 
             on<&GearRecolor::OnBatchDraw>(ev::Event::OnM2BatchDraw);
             on<&GearRecolor::OnBlpLoad>(ev::Event::OnBlpLoad);
             on<&GearRecolor::OnTextureUpload>(ev::Event::OnTextureUpload);
             on<&GearRecolor::OnInput>(ev::Event::OnInput);
             on<&GearRecolor::OnEndScene>(ev::Event::OnEndScene);
-            WLOG_INFO("gear-recolor: events bound (paste hooks via modules::Register)");
+            on<&GearRecolor::OnWorldRenderEnd>(ev::Event::OnWorldRenderEnd);
+            on<&GearRecolor::OnItemSlotChange>(ev::Event::OnItemSlotChange);
+            on<&GearRecolor::OnItemSlotClear>(ev::Event::OnItemSlotClear);
+            WLOG_INFO("gear-recolor: events bound (world-only OC, displayInfo body tint)");
+        }
+
+        void OnItemSlotChange(const ev::ItemSlotChangeArgs& a)
+        {
+            const int equipSlot = ModelSlotToEquipSlot(a.modelSlot);
+            if (equipSlot < 0)
+                return;
+
+            OwnerGuid owner = 0;
+            if (!ResolveOwnerFromCmo(a.charModelObj, owner))
+                return;
+
+            const uint32_t displayId = GuardedDisplayIdFromItemData(a.itemDataPtr);
+            const OwnerGuid self = ActiveOwnerGuid();
+            const bool isSelf = self && GuidSamePlayer(owner, self);
+
+            // Drop catch sample on equip identity change (unequip OR swap).
+            if (isSelf)
+            {
+                ClearCatchSampleForSlot(equipSlot);
+            }
+
+            if (displayId == 0)
+            {
+                ClearDisplaySlot(owner, equipSlot);
+                if (isSelf && IsBodyEquipSlot(equipSlot))
+                    RequestBodyRebuildForSlot(equipSlot);
+            }
+            else
+            {
+                SetDisplaySlotFromDisplayId(owner, equipSlot, displayId);
+            }
+        }
+
+        void OnItemSlotClear(const ev::ItemSlotClearArgs& a)
+        {
+            if (a.equipSlotWow >= static_cast<uint32_t>(kMaxEquipSlots))
+                return;
+            OwnerGuid owner = 0;
+            if (!ResolveOwnerFromCmo(a.charModelObj, owner))
+                return;
+            const int equipSlot = static_cast<int>(a.equipSlotWow);
+            ClearDisplaySlot(owner, equipSlot);
+            const OwnerGuid self = ActiveOwnerGuid();
+            if (self && GuidSamePlayer(owner, self))
+                OnLocalBodySlotRefsCleared(equipSlot);
+        }
+
+        void OnWorldRenderEnd(const ev::WorldRenderEndArgs&)
+        {
+            // World finished — UI 3D (paperdoll C, DressUp, etc.) draws next.
+            g_ocWorldPass.store(false, std::memory_order_relaxed);
         }
 
         void OnInput(const ev::InputArgs& a)
@@ -4220,6 +6045,9 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
 
         void OnEndScene(const ev::EndSceneArgs& a)
         {
+            // Arm OC tint for the next frame's world pass (UI of this frame is done).
+            g_ocWorldPass.store(true, std::memory_order_relaxed);
+
             auto* dev = static_cast<IDirect3DDevice9*>(a.device);
             FlushOcCatchPending(dev);
 
@@ -4245,14 +6073,14 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
             if (!a.model || !a.device)
                 return;
 
-            // Phase 0: sample OC albedo for Catch (bound texture, pre tint redraw).
-            // Phase 1: live mesh tint after native DIP.
+            // No OC work during UI ModelFrame draws (Character C, DressUp, glue).
+            if (!g_ocWorldPass.load(std::memory_order_relaxed))
+                return;
+
             if (a.phase == 0)
             {
-                bool allowed = ModelInAllowedTree(a.model);
-                if (!allowed)
-                    allowed = TryCaptureUiOcRoot(a.model) && ModelInAllowedTree(a.model);
-                if (!allowed)
+                OwnerGuid owner = 0;
+                if (!ResolveModelTintOwner(a.model, owner))
                     return;
                 void* model = ResolveM2Model(a.model);
                 const char* stem = model ? m2::PathStem(model) : nullptr;
@@ -4262,89 +6090,38 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
                 const int nc = CandidateSlotsForOcPath(stem, cands, 4);
                 if (nc <= 0)
                     return;
+                if (owner != 0 && owner != ActiveOwnerGuid())
+                    return;
                 auto* dev = static_cast<IDirect3DDevice9*>(a.device);
                 for (int i = 0; i < nc; ++i)
                     QueueOcCatchFromDevice(dev, cands[i], stem);
                 return;
             }
 
-            if (a.phase != 1 || !AnySlotActive())
+            if (a.phase != 1)
+                return;
+            if (!AnySlotActive() && !AnyRemoteTintActive())
                 return;
 
-            // Drop stale paperdoll OC roots when no UI is open — freed pointers can
-            // be reused by world units and would wrongly pass ModelInAllowedTree.
-            if (!g_characterUiActive.load(std::memory_order_relaxed)
-                && !g_previewUiActive.load(std::memory_order_relaxed)
-                && !IsUiCaptureArmed())
-            {
-                if (g_uiOcRootN > 0)
-                    ClearUiOcRoots();
-            }
-
-            // ObjectComponents (helm/shoulder/weapon): only tint meshes under the
-            // local player or the armed DressUp preview — never other PCs/NPCs.
-            if (!ModelInAllowedTree(a.model))
-            {
-                // Paperdoll / DressUp: shallow UI roots registered on first OC draw.
-                if (!TryCaptureUiOcRoot(a.model) || !ModelInAllowedTree(a.model))
-                    return;
-            }
+            OwnerGuid owner = 0;
+            if (!ResolveModelTintOwner(a.model, owner))
+                return;
 
             void* model = ResolveM2Model(a.model);
             const char* stem = model ? m2::PathStem(model) : nullptr;
             if (!PathLooksValid(stem))
                 return;
 
-            // Draft tints only affect DressUp / UI preview meshes — not the world player.
-            bool previewDraw = false;
-            if (g_previewUiActive.load(std::memory_order_relaxed))
-            {
-                void* player = LocalPlayerBodyModel();
-                void* preview = g_previewModel.load(std::memory_order_relaxed);
-                void* cur = a.model;
-                for (int depth = 0; depth < 24 && cur; ++depth)
-                {
-                    if (player && cur == player)
-                    {
-                        previewDraw = false;
-                        break;
-                    }
-                    if (preview && cur == preview)
-                    {
-                        previewDraw = true;
-                        break;
-                    }
-                    bool uiHit = false;
-                    {
-                        std::lock_guard<std::mutex> lock(g_uiRootMu);
-                        for (int i = 0; i < g_uiOcRootN; ++i)
-                        {
-                            if (cur == g_uiOcRoots[i])
-                            {
-                                uiHit = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (uiHit)
-                    {
-                        previewDraw = true;
-                        break;
-                    }
-                    cur = wxl::game::unit::ModelParent(cur);
-                }
-            }
-            g_hslPreferDraft.store(previewDraw, std::memory_order_relaxed);
-
             SlotHsl hsl{};
-            int usedSlot = -1;
-            const bool got = TryHslForPath(stem, hsl, &usedSlot);
-            g_hslPreferDraft.store(false, std::memory_order_relaxed);
-            if (!got)
+            if (!TryHslForPathOwner(owner, stem, hsl, nullptr))
                 return;
 
+            // Absolute: self tint only on live unit body tree. Remotes already
+            // resolved via live unit Model() in ResolveModelTintOwner.
+            void* body = OwnerBodyModel(owner);
+            if (!body || !ModelIsUnderRoot(a.model, body))
+                return;
 
-            // Always live mesh for OC — upload bake is one-shot and skips live Hue.
             RedrawTinted(a, hsl);
         }
 
@@ -4362,6 +6139,11 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
                 // Fresh BLP bytes — drop any stale orig keyed by this handle so we
                 // never restore a previous item's palette into a reused pointer.
                 g_texTint.erase(a.handle);
+                // Drop pathOrig for this path so the next paste re-captures from
+                // live TextureCache (never call EnsurePathOrig here — mips are
+                // often not mapped yet during OnBlpLoad → AV at login).
+                if (IsItemComponentTexture(a.name))
+                    g_pathOrig.erase(TexPathKey(a.name));
             }
         }
 
@@ -4371,12 +6153,8 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
             // SafeGetPal does not work on these handles). Fired AFTER native upload.
             if (!a.texture || !a.width || !a.height)
                 return;
-            // Preview OC draws must not clobber the Catch bank used by /recolor.
-            if (g_previewUiActive.load(std::memory_order_relaxed)
-                && g_hslPreferDraft.load(std::memory_order_relaxed))
-                return;
             const char* name = TextureName(a.texture);
-            if (!IsObjectComponentAlbedo(name))
+            if (!IsObjectComponentAlbedo(name) || !IsObjectComponentPathSane(name))
                 return;
             int cands[4] = {};
             const int nc = CandidateSlotsForOcPath(name, cands, 4);
@@ -4562,8 +6340,18 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
             kCharRenderPrep,
             reinterpret_cast<void*>(&hkRenderPrep),
             reinterpret_cast<void**>(&g_origRenderPrep));
-        WLOG_INFO("gear-recolor: paste hooks skinLayout=%d itemPaste=%d renderPrep=%d",
-            okSkinLayout ? 1 : 0, okItemPaste ? 1 : 0, okRenderPrep ? 1 : 0);
+        const bool okGetPal = wxl::core::hook::Install("GearRecolor_TexCacheGetPal",
+            wxl::offsets::engine::gx::kTextureCacheGetPal,
+            reinterpret_cast<void*>(&hkTextureCacheGetPal),
+            reinterpret_cast<void**>(&g_origGetPal));
+        const bool okGetMip = wxl::core::hook::Install("GearRecolor_TexCacheGetMip",
+            wxl::offsets::engine::gx::kTextureCacheGetMip,
+            reinterpret_cast<void*>(&hkTextureCacheGetMip),
+            reinterpret_cast<void**>(&g_origGetMip));
+        WLOG_INFO("gear-recolor: paste hooks skinLayout=%d itemPaste=%d renderPrep=%d "
+            "getPal=%d getMip=%d",
+            okSkinLayout ? 1 : 0, okItemPaste ? 1 : 0, okRenderPrep ? 1 : 0,
+            okGetPal ? 1 : 0, okGetMip ? 1 : 0);
     }
 
     struct PasteHookInstaller

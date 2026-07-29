@@ -1,85 +1,111 @@
 # wxl-gear-recolor
 
-> **PROJECT FROZEN** — development paused until textureitem→3Ditem conversion is solved.
-> Details below.
+Per-**item**, per-**player** gear tinting for **WarcraftXL** (WotLK 3.3.5a client DLL) with optional **AzerothCore** server persistence and transmog UI integration.
 
-## Why this project is frozen (Jul 2026)
-
-The project is frozen until I figure out a bunch of stuff. Here's what's going on:
-
-What you find on GitHub is **perfectly working** if you only use it on yourself and do not
-count it as part of transmogging. It attaches to the **slot**, not the specific item —
-meaning the tint set up on chest will work on all chests and so on. However it might or
-might not tint other players' and other NPCs' items from time to time (it's a bug).
-
-I tried to merge it with the tmog system: make tints **player-specific** and
-**item-specific**, integrate it in the transmog UI, have the server save the tint per-item,
-and build client-server queries to know which item should have which tint. It worked, but
-with some stupid recurring bugs that I can't manage to fix.
-
-To understand those bugs you first have to know that gear is divided into two types:
-
-- **3D items** — actual 3D models added on top of the character (head, shoulder,
-  weapons). I call these *3Ditems*.
-- **Texture items** — only texture glued straight to the character's model, often
-  forcing that model to change its shape (chest, waist, legs, boots, and so on). I call
-  these *textureitems*.
-
-There are bugs involving 3Ditems and bugs involving textureitems.
-
-**3Ditems** will share their tint to nearby NPCs. This is fixable but re-bugs constantly
-as I keep trying to fix what's next (the real deal).
-
-**Textureitems** are the real problem. Because they edit the player's model, changing
-tint of one of those items can change the tint of another piece of the model — sometimes
-even a piece that isn't gear per se, such as the player's skin. Applying a tint can also
-apply it to other textureitems on nearby players' gear. This is visual only (on their
-client, they don't see this), but it's gamebreaking and fucking unfixable.
-
-The idea now is to make a script that converts all textureitems into 3Ditems — which
-again also have some bugs, but they're minor, fixable, and much easier to manage. Once
-that is fine, I can rework the whole tint module to work for all slots like it does
-currently for head/shoulder/weps, and then it's gg.
-
-That script isn't easy to do. I'm wasting tens of millions of tokens into it and I can't
-manage to make it working. **If you know how to do this, hit me up.** Once that is done
-I'm convinced I can finish the project in a matter of hours. Finished project = you install
-this on your server and you literally have tints on top of tmogs.
-
-Last thing: even if you were able to fix the itemtexture bugs I can't manage to fix, it
-would still mean that the system would not work on backported items from later xpacs which
-do involve 3D models on slots where WotLK only had textureitems. So regardless of your
-debugging skill, the path of converting textureitems to 3Ditems is still the way to go.
+Tints work like transmog appearances: each **item instance** (`item_guid`) stores its own color; the server broadcasts to nearby players so observers see the same tint.
 
 ---
-
-Client-side gear recolor for **WarcraftXL** (WotLK 3.3.5a client DLL / module system).
-
-Pick a color per equipment slot (`/recolor`) — **Solid** or **Selective** (from→to color rules). No server DB changes.
 
 ## Contents
 
 | Path | What |
 |---|---|
-| `module/wxl-gear-recolor/` | WarcraftXL DLL module (`scripts/wxl-gear-recolor/`) |
-| `addon/WXLRecolor/` | Standalone WotLK addon (`Interface/AddOns/WXLRecolor/`) |
+| `module/wxl-gear-recolor/` | WarcraftXL DLL module → copy to `wxl-core/scripts/wxl-gear-recolor/` |
+| `server/mod-item-tint/` | **AzerothCore-only** module: DB + `WXL_TINT` addon protocol (not generic AC) |
+| `addon/HorizontalTools/Recolor/` | `/recolor` UI (drop into `Interface/AddOns/HorizontalTools/Recolor/`) |
+| `addon/HorizontalTools/Transmog/frames/Tints.lua` | Transmog **Tints tab only** (requires HorizonTransmog / HorizontalTools transmog frame) |
+| `addon/WXLRecolor/` | Standalone minimal addon (optional; HorizontalTools is the full UI) |
 
-## Install
+---
 
-1. Copy `module/wxl-gear-recolor` into your WarcraftXL tree as `wxl-core/scripts/wxl-gear-recolor/`.
-2. Rebuild / redeploy `WarcraftXL.dll` into the client folder.
-3. Copy `addon/WXLRecolor` into `Interface/AddOns/`.
-4. In-game: `/recolor`.
+## 3D items vs texture items
 
-Opt-out: create `WarcraftXL_gear-recolor.disable` next to `Wow.exe`.
+WoW body gear uses two different client paths:
 
-## How it works (short)
+| | **Texture items** | **3D items** |
+|---|---|---|
+| **Slots** | Shirt, chest, waist, legs, feet, wrists, hands | Head, shoulders, back, tabard, weapons |
+| **How they render** | BLP layers pasted onto the **character composite** during `CharComponent` assemble (`Item\TextureComponents\…`) | Separate **M2 models** attached on top (`Item\ObjectComponents\…`) |
+| **Tint hook** | Paste-time palette/BGRA overlay on shared `TextureCache` | Live pixel colorize on ObjectComponent draw |
+| **Nickname** | *textureitems* | *3Ditems* |
 
-- **Body armor** (chest, legs, hands, …): colorize paletted `Item\TextureComponents\…` before CharComponent paste.
-- **3D attachments** (head, shoulders, weapons): live pixel-shader colorize on ObjectComponent draw.
-- Tint math: keep luminance (shading), apply picked RGB as chroma (selective uses soft match + neighbor cleanup on OC).
-- Enter-world prefers natural paste tint (char-select quality); logout flushes TextureCache backups so glue/relog do not reuse stale pointers.
-- Glue scoping: body tint is sticky/one-shot on the local CharacterComponent only; 3D gear (head/shoulder/weapon) uses the same sticky root on char-select and the live player model in-world.
+Both paths share the same **per-item** tint data from the server; only the client application mechanism differs.
+
+---
+
+## Install (client)
+
+1. Copy `module/wxl-gear-recolor/` → your WarcraftXL tree: `wxl-core/scripts/wxl-gear-recolor/`
+2. Rebuild / deploy `WarcraftXL.dll` (`wxl-core/build.ps1`)
+3. Copy addon files into `Interface/AddOns/` (see table above)
+4. Opt-out: `WarcraftXL_gear-recolor.disable` next to `Wow.exe`
+
+Requires **WarcraftXL** (not stock WoW). Lua calls `WXL_Recolor*` exports from the DLL.
+
+---
+
+## Install (server — AzerothCore only)
+
+> **Warning:** `server/mod-item-tint/` is written for **this project's AzerothCore fork** (custom transmog visibility hooks, `WXL_TINT` protocol). It may **not compile or run** on vanilla AzerothCore without porting.
+
+1. Copy `server/mod-item-tint/` → `azerothcore-wotlk/modules/mod-item-tint/`
+2. Run SQL once on **acore_characters**:
+   - `server/mod-item-tint/data/sql/db-characters/custom_item_tint.sql`
+3. Rebuild `worldserver`, enable module in CMake as usual for AC modules
+4. Clients must register addon prefix `WXL_TINT` (handled by the Lua addons)
+
+Protocol (server → client): `WXL_TINT PUSH\t<ownerGuid>\t<slot>\t…`  
+Protocol (client → server): `WXL_TINT SET|CLEAR\t…` on Apply from transmog tints tab or `/recolor`.
+
+---
+
+## How it works now
+
+- **Persistence:** `custom_item_tint` table keyed by `item_guid` (not equip slot).
+- **Visibility:** Same model as transmog — on equip / login / range enter, server PUSHes tint to self + observers.
+- **Client:** `GearRecolor.cpp` applies tint on texture paste (body) or OC draw (3D); remotes use orphan paste resolve + natural `RenderPrep` (no forced full-body rebuild).
+
+---
+
+## Bugs we fixed (the hard ones)
+
+### 1) Observer texture corruption (*textureitems*) — **fixed Jul 2026**
+
+**Symptom:** Tint Apply looked perfect on **your** client; on **other** clients the tinted player’s **face/body broke** (wrong layers, wiped composite).
+
+**Not the cause:** Server PUSH payload, wrong tint data, or “missing CharComponent for remotes” (RE proved RenderPrep + component lookup worked).
+
+**Actual cause (three layers):**
+
+1. **Paste outside RenderPrep** — Most `TextureComponents` pastes run with no assemble owner (`prepOwner=0`). Tint never applied; unrelated body sections kept repasting and mixing composites.
+2. **Force rebuild on remote players** — After Apply, `ForceOwnerBodyRebuild` re-pasted large section masks **without tint**, undoing good work and corrupting the observer view.
+3. **GUID map key mismatch** — Lua PUSH stores equip snap under one 64-bit GUID; RenderPrep/Force used another key for the **same player** (same `ownerLow`, different high bits). `EquipSnapKnown` used exact map lookup (no `GuidSamePlayer` fallback) → Force pasted chest **untinted** even when orphan tint had just succeeded.
+
+**Fix:** `CanonicalTintOwner()`, no Force on remotes, `ResolveOrphanPasteOwner`, stem-based slot matching for full chest piece (sleeves + torso). Details: see `DBC_Tool/WXL-REMOTE-RECOLOR-SESSION.txt` in the dev tree if present.
+
+### 2) NPC tint bleed (*3Ditems*) — **fixed (workaround)**
+
+**Symptom:** Recoloring head/shoulder/weapons on your character also recolored **random NPCs** (and sometimes paperdoll previews).
+
+**Cause:** We tried to sync tints onto **paperdoll, character-select (glue), and enter-world** preview models using the same sticky model root as the live player. Those UI/glue contexts **reuse model pointers and OC draw paths** that also serve NPCs → tint state leaked by shared `ObjectComponent` / model identity.
+
+**Fix (current):** **Ignore paperdoll, glue, and character-panel (`C`) models entirely** for tint application. Live in-world self + other players only.
+
+**Known limitation:** Character select, dressing room, and default paperdoll **do not show tints correctly** (intentionally left broken until we have a safe separate preview path).
+
+---
+
+## Known issues
+
+| Issue | Notes |
+|---|---|
+| **`/reload`** | Can leave some body textures in a bad state; needs investigation |
+| **Transmog Tints tab** | Less tint variety than `/recolor` (gradients, selective, etc.); will improve |
+| **`/recolor` addon** | May be removed once transmog tints tab is feature-complete |
+| **Paperdoll / glue / `C` panel** | No tint preview (see NPC bug workaround) |
+| **AzerothCore module** | Project-specific; not guaranteed on other cores |
+
+---
 
 ## License
 
