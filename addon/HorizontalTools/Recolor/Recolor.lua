@@ -486,6 +486,54 @@ local function sendTint(body)
     SendAddonMessage(ADDON_MSG_PREFIX, body, "WHISPER", UnitName("player"))
 end
 
+-- /reload does not fire PLAYER_ENTERING_WORLD; cold login PUSH can race SetSelfGuid.
+local cancelReloadRecovery = false
+
+local function scheduleTintResync(delaySec)
+    delaySec = tonumber(delaySec) or 0.5
+    local follow = CreateFrame("Frame")
+    local t = 0
+    local phase = 0
+    follow:SetScript("OnUpdate", function(self, elapsed)
+        t = t + elapsed
+        if phase == 0 then
+            if t < delaySec then
+                return
+            end
+            phase = 1
+            t = 0
+            WXLRecolor_RefreshEquipSnap()
+            sendTint("REQ")
+            return
+        end
+        if t < 1.0 then
+            return
+        end
+        self:SetScript("OnUpdate", nil)
+        WXLRecolor_RefreshEquipSnap()
+        if type(WXL_RecolorForceBodyRebuild) == "function" then
+            WXL_RecolorForceBodyRebuild()
+        end
+    end)
+end
+
+local function runReloadRecovery()
+    local guid = UnitGUID and UnitGUID("player")
+    if not guid then
+        return
+    end
+    if type(WXL_RecolorSetSelfGuid) == "function" then
+        WXL_RecolorSetSelfGuid(guid)
+    end
+    if type(WXL_RecolorOnUiReload) == "function" then
+        WXL_RecolorOnUiReload()
+    elseif type(WXL_RecolorForceBodyRebuild) == "function" then
+        WXL_RecolorForceBodyRebuild()
+    end
+    WXLRecolor_RefreshEquipSnap()
+    scheduleTintResync(0.25)
+end
+
 syncSlotToServer = function(slot, allowClear)
     slot = tonumber(slot)
     if not slot then
@@ -696,6 +744,7 @@ tintComm:SetScript("OnEvent", function(_, event, ...)
             WXL_RecolorClearAllRemote()
         end
     elseif event == "PLAYER_ENTERING_WORLD" then
+        cancelReloadRecovery = true
         local guid = UnitGUID and UnitGUID("player")
         if guid and type(WXL_RecolorSetSelfGuid) == "function" then
             WXL_RecolorSetSelfGuid(guid)
@@ -706,18 +755,9 @@ tintComm:SetScript("OnEvent", function(_, event, ...)
                 clearLocalSlot(s)
             end
         end
-        -- Immediate + delayed: catch pre-PUSH and post-PUSH settle.
+        -- Equip snap now; REQ after settle (login PUSH often arrives before addon ready).
         WXLRecolor_DumpTintState("entering_world_immediate")
-        local delay = CreateFrame("Frame")
-        local t = 0
-        delay:SetScript("OnUpdate", function(self, elapsed)
-            t = t + elapsed
-            if t < 2.0 then
-                return
-            end
-            self:SetScript("OnUpdate", nil)
-            WXLRecolor_DumpTintState("entering_world")
-        end)
+        scheduleTintResync(0.5)
     end
 end)
 
@@ -2204,3 +2244,19 @@ boot:SetScript("OnEvent", function(_, event, arg1)
         end
     end
 end)
+
+-- After /reload: in-world but no PLAYER_ENTERING_WORLD — recover tints from server.
+if UnitGUID and UnitGUID("player") then
+    local reloadProbe = CreateFrame("Frame")
+    local probeT = 0
+    reloadProbe:SetScript("OnUpdate", function(self, elapsed)
+        probeT = probeT + elapsed
+        if probeT < 1.0 then
+            return
+        end
+        self:SetScript("OnUpdate", nil)
+        if not cancelReloadRecovery then
+            runReloadRecovery()
+        end
+    end)
+end

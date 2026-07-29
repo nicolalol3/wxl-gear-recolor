@@ -10,6 +10,7 @@
 //   WXL_RecolorGetSlotGradient(slot) -> active,nStops,fill, then nStops*rgb
 //   WXL_RecolorBeginBatch / WXL_RecolorEndBatch([forceRebuild])
 //   WXL_RecolorFlushTex()  — logout / leave-world TextureCache reset
+//   WXL_RecolorOnUiReload() — /reload: drop stale tex handles, rebuild tinted sections
 //   WXL_RecolorForceBodyRebuild / WXL_RecolorClearSlot / WXL_RecolorClearAll
 //   WXL_RecolorCatchSlotColors(slot) -> n, then n*(r,g,b)  (selective Catch)
 //   WXL_RecolorArmScreenSample / GetScreenSample / CancelScreenSample
@@ -3007,13 +3008,12 @@ namespace
     }
 
     // Stem match for one owner (no RenderPrep context required).
+    // Same rules for self and remotes — tint + (display stem OR component→slot).
     bool MatchComponentTextureForOwner(OwnerGuid owner, const char* name,
         int pasteSection, SlotHsl& out, int& outSlot)
     {
         owner = CanonicalTintOwner(owner);
         if (!owner || !name || !IsItemComponentTexture(name))
-            return false;
-        if (!EquipSnapKnown(owner))
             return false;
 
         const int pathComp = ComponentIndexFromTexturePath(name);
@@ -3025,20 +3025,24 @@ namespace
 
         int bestSlot = -1;
         int bestScore = -1;
-        auto consider = [&](int slot, int scoreBonus)
+        auto consider = [&](int slot, int scoreBonus, bool requireStem)
         {
             if (slot < 0 || slot >= kMaxEquipSlots)
-                return;
-            if (EquipSnapEntry(owner, slot) == 0)
-                return;
-            DisplaySlotInfo info{};
-            if (!GetDisplaySlotInfo(owner, slot, info))
-                return;
-            if (!PathMatchesSlotComponent(name, info, compIdx))
                 return;
             SlotHsl hsl{};
             if (!TrySlotHslForOwner(owner, slot, hsl))
                 return;
+            if (requireStem)
+            {
+                if (EquipSnapEntry(owner, slot) == 0)
+                    return;
+                DisplaySlotInfo info{};
+                if (!GetDisplaySlotInfo(owner, slot, info))
+                    return;
+                if (!PathMatchesSlotComponent(name, info, compIdx)
+                    && !PathMatchesAnyStem(name, info))
+                    return;
+            }
             const int score = ScoreComponentSlotMatch(compIdx, pathComp, slot)
                 + scoreBonus;
             if (score > bestScore)
@@ -3048,19 +3052,30 @@ namespace
             }
         };
 
-        // Primary: any tinted slot whose ItemDisplayInfo owns this component stem
-        // (chest tint must hit sleeve_au/bracer_al from the same chest piece).
+        // Primary: tinted slot whose ItemDisplayInfo owns this component stem.
         for (int slot = 0; slot < kMaxEquipSlots; ++slot)
-            consider(slot, 8);
+            consider(slot, 8, true);
 
-        // Fallback: legacy compIdx → equip slot candidates.
+        // Fallback: component index → equip slot candidates (stem still required).
         if (bestSlot < 0)
         {
             int slotCands[4];
             int nSlotCands = 0;
             CandidateEquipSlotsForComponent(compIdx, slotCands, nSlotCands);
             for (int si = 0; si < nSlotCands; ++si)
-                consider(slotCands[si], 0);
+                consider(slotCands[si], 0, true);
+        }
+
+        // Last resort (identical for self and remotes): tinted slot by component
+        // folder when display stems lag (tmog / observer PUSH). Caller still binds
+        // a single owner — does not reintroduce cross-owner bleed.
+        if (bestSlot < 0)
+        {
+            int slotCands[4];
+            int nSlotCands = 0;
+            CandidateEquipSlotsForComponent(compIdx, slotCands, nSlotCands);
+            for (int si = 0; si < nSlotCands; ++si)
+                consider(slotCands[si], -2, false);
         }
 
         if (bestSlot < 0)
@@ -3097,6 +3112,10 @@ namespace
     }
 
     // Paste outside RenderPrep: resolve owner from texture stem + equip snap.
+    // NEVER consider the local player here — self tints only apply when
+    // g_prepOwnerGuid/self RenderPrep (TryHslForComponentTexture). Including self
+    // painted local HSL into other units' composites on post-relog assemble
+    // (faces / underwear / shared item paths looked "same color as my tint").
     bool ResolveOrphanPasteOwner(const char* name, int pasteSection,
         OwnerGuid& outOwner, SlotHsl& outHsl, int& outSlot)
     {
@@ -3105,6 +3124,7 @@ namespace
         if (!name || !IsItemComponentTexture(name))
             return false;
 
+        const OwnerGuid self = ActiveOwnerGuid();
         std::vector<OwnerGuid> owners;
         CollectTintedOwners(owners);
         OwnerGuid bestOwner = 0;
@@ -3113,6 +3133,8 @@ namespace
         int bestScore = -1;
         for (OwnerGuid owner : owners)
         {
+            if (self && GuidSamePlayer(owner, self))
+                continue;
             SlotHsl hsl{};
             int slot = -1;
             if (!MatchComponentTextureForOwner(owner, name, pasteSection, hsl, slot))
@@ -3273,6 +3295,27 @@ namespace
             g_texNames.clear();
             // Keep g_pathOrig — pure pixel bytes, not engine pointers.
         }
+        (void)reason;
+        (void)cacheN;
+    }
+
+    void InvalidatePathOrigForUiReload()
+    {
+        std::lock_guard<std::mutex> lock(g_texMutex);
+        for (auto it = g_pathOrig.begin(); it != g_pathOrig.end(); )
+        {
+            if (IsItemComponentTexture(it->second.path.c_str()))
+                it = g_pathOrig.erase(it);
+            else
+                ++it;
+        }
+    }
+
+    void OnUiReload()
+    {
+        FlushTexTintState("ui_reload");
+        InvalidatePathOrigForUiReload();
+        ForceAllowedBodyRebuild();
     }
 
     std::string TexPathKey(const char* name)
@@ -4152,28 +4195,58 @@ namespace
                 int slot = -1;
                 bool hasHsl = TryHslForComponentTexture(name, section, hsl, &slot);
                 bool orphanTint = false;
-                if (!hasHsl && ResolveOrphanPasteOwner(name, section, effectiveOwner, hsl, slot))
+                // Orphan never uses self (ResolveOrphanPasteOwner). Same fallback for
+                // every other owner: prep unbound, or prep matches the found remote.
+                if (!hasHsl)
                 {
-                    hasHsl = true;
-                    orphanTint = !allow;
-                    if (orphanTint)
-                        allow = true;
+                    OwnerGuid found = 0;
+                    SlotHsl foundHsl{};
+                    int foundSlot = -1;
+                    if (ResolveOrphanPasteOwner(name, section, found, foundHsl, foundSlot)
+                        && (effectiveOwner == 0 || GuidSamePlayer(effectiveOwner, found)))
+                    {
+                        effectiveOwner = found;
+                        hsl = foundHsl;
+                        slot = foundSlot;
+                        hasHsl = true;
+                        orphanTint = !allow;
+                        if (orphanTint)
+                            allow = true;
+                    }
                 }
                 else if (hasHsl && effectiveOwner == 0)
+                {
                     effectiveOwner = CanonicalTintOwner(
                         g_prepOwnerGuid.load(std::memory_order_relaxed));
+                    if (!effectiveOwner)
+                    {
+                        // TryHsl resolved via local prepModel==player without prepOwner.
+                        const OwnerGuid selfGuid = ActiveOwnerGuid();
+                        if (selfGuid)
+                            effectiveOwner = selfGuid;
+                    }
+                }
 
                 const OwnerGuid self = ActiveOwnerGuid();
+                if (hasHsl && !allow && effectiveOwner != 0
+                    && !(self && GuidSamePlayer(effectiveOwner, self)))
+                {
+                    // Remote tint matched but IsPasteTintAllowed failed — same
+                    // force path self gets via assembling RenderPrep.
+                    orphanTint = true;
+                    allow = true;
+                }
+
                 const uint32_t equipEntry = (slot >= 0)
                     ? EquipSnapEntry(effectiveOwner, slot) : 0;
                 const int equipKnown = EquipSnapKnown(effectiveOwner) ? 1 : 0;
                 const bool isSelf = self != 0 && GuidSamePlayer(effectiveOwner, self);
 
-                // Body tint requires stem match (hasHsl) AND known equip with item present.
-                const bool emptySlot = slot >= 0 && equipKnown && equipEntry == 0;
-                const bool remoteNoItem = !isSelf && slot >= 0 && equipEntry == 0;
+                // Same gate for everyone: need owner + hsl. Self still blocks known-empty
+                // slots (phantoms). Remotes may tint when entry snap lagged behind PUSH.
+                const bool emptySelf = isSelf && slot >= 0 && equipKnown && equipEntry == 0;
                 const bool doTint = allow && hasHsl && slot >= 0 && effectiveOwner != 0
-                    && equipKnown && !emptySlot && !remoteNoItem;
+                    && !emptySelf;
                 bool pathOk = false;
 
                 // #region agent log
@@ -4437,6 +4510,56 @@ namespace
         // (SetSelfGuid) re-pastes the entire body and bugs composites. Per-slot
         // ApplyLocalPayload / SetSlot rebuilds only the sections that need it.
         SaveLocalHslIfCommitted();
+    }
+
+    // Login PUSH often arrives before SetSelfGuid — ApplyOwnerTint stored them as
+    // remotes. Local paste only reads g_slotHsl for self → invisible until
+    // unequip/reequip. Pull matching remote rows into the local table.
+    void PromoteRemoteTintsToLocal(OwnerGuid self)
+    {
+        if (!self)
+            return;
+        OwnerSlotHsl promoted{};
+        bool any = false;
+        {
+            std::lock_guard<std::mutex> lock(g_remoteMu);
+            for (auto it = g_remoteTints.begin(); it != g_remoteTints.end(); )
+            {
+                if (!GuidSamePlayer(it->first, self))
+                {
+                    ++it;
+                    continue;
+                }
+                for (int s = 0; s < kMaxEquipSlots; ++s)
+                {
+                    const SlotHsl& h = it->second[static_cast<size_t>(s)];
+                    if (h.active)
+                    {
+                        promoted[static_cast<size_t>(s)] = h;
+                        any = true;
+                    }
+                }
+                g_remoteCcModels.erase(it->first);
+                g_remoteCcComponents.erase(it->first);
+                it = g_remoteTints.erase(it);
+            }
+        }
+        if (!any)
+            return;
+        uint32_t mask = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_colorMutex);
+            for (int s = 0; s < kMaxEquipSlots; ++s)
+            {
+                if (!promoted[static_cast<size_t>(s)].active)
+                    continue;
+                g_slotHsl[s] = promoted[static_cast<size_t>(s)];
+                g_draftHsl[s] = {};
+                mask |= SectionMaskForEquipSlot(s);
+            }
+        }
+        if (mask)
+            DirtyOwnerSections(self, mask);
     }
 
     // Solid OC PS — single color (byte-stable lighting path).
@@ -5631,11 +5754,26 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
             wlua::PushBoolean(state, 0);
             return 1;
         }
+        const OwnerGuid prev = g_cachedSelfGuid.load(std::memory_order_relaxed);
         g_cachedSelfGuid.store(owner, std::memory_order_relaxed);
-        // Server PushAllEquipped is source of truth — clear stale local slots.
-        ClearAllHsl();
+        // Character switch only — /reload keeps same guid and g_slotHsl in DLL.
+        if (!prev || !GuidSamePlayer(prev, owner))
+            ClearAllHsl();
+        // Adopt early login PUSHes that landed as remotes (self was still 0).
+        PromoteRemoteTintsToLocal(owner);
         wlua::PushBoolean(state, 1);
         return 1;
+    }
+
+    int __cdecl LuaRecolorOnUiReload(void* state)
+    {
+        OnUiReload();
+        if (state)
+        {
+            wlua::PushBoolean(state, 1);
+            return 1;
+        }
+        return 0;
     }
 
     int __cdecl LuaRecolorBeginEquipSnap(void* state)
@@ -5955,6 +6093,7 @@ float4 main(float2 uv : TEXCOORD0, float4 diff : COLOR0) : COLOR0
             wlua::RegisterFunction("WXL_RecolorBeginBatch", &LuaRecolorBeginBatch);
             wlua::RegisterFunction("WXL_RecolorEndBatch", &LuaRecolorEndBatch);
             wlua::RegisterFunction("WXL_RecolorFlushTex", &LuaRecolorFlushTex);
+            wlua::RegisterFunction("WXL_RecolorOnUiReload", &LuaRecolorOnUiReload);
             wlua::RegisterFunction("WXL_RecolorArmScreenSample", &LuaRecolorArmScreenSample);
             wlua::RegisterFunction("WXL_RecolorCancelScreenSample", &LuaRecolorCancelScreenSample);
             wlua::RegisterFunction("WXL_RecolorGetScreenSample", &LuaRecolorGetScreenSample);

@@ -10,6 +10,7 @@
  *   WXL_TINT SET\tslot\tmode\tdata   (UI write)
  *   WXL_TINT CLEAR\tslot
  *   WXL_TINT ACK\tok|err\t...
+ *   WXL_TINT REQ   (client /reload — re-PUSH all equipped tints to self + resync nearby)
  *   WXL_TINT PUSH\t0xOwnerGuid\tslot\tmode\tdata\tentry
  *   WXL_TINT PUSH\t0xOwnerGuid\tslot\tclear
  */
@@ -68,6 +69,8 @@ namespace
     std::unordered_set<uint32> g_slotTintLive;
     // Last PUSH fingerprint so identical visible_item_slot re-pushes are skipped.
     std::unordered_map<uint32, std::string> g_slotTintLiveFp;
+
+    void SyncNearbyTints(Player* player);
 
     std::string GuidHex(ObjectGuid const& guid)
     {
@@ -481,7 +484,18 @@ namespace
             HandleClear(player, uint8(slot));
             return;
         }
-        // REQ removed — server pushes proactively (Transmog-style).
+        if (tokens[0] == "REQ")
+        {
+            LoadOwnerTints(player->GetGUID().GetCounter());
+            PushAllEquipped(player, player);
+            SyncNearbyTints(player);
+            SendAddon(player, "ACK\tok\treq");
+            // #region agent log
+            DumpTintState(player, "reload_req");
+            // #endregion
+            return;
+        }
+        // SET / CLEAR / REQ only — server pushes proactively on equip/login.
     }
 
     void SyncNearbyTints(Player* player)

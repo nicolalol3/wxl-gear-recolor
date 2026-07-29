@@ -54,8 +54,8 @@ Requires **WarcraftXL** (not stock WoW). Lua calls `WXL_Recolor*` exports from t
 3. Rebuild `worldserver`, enable module in CMake as usual for AC modules
 4. Clients must register addon prefix `WXL_TINT` (handled by the Lua addons)
 
-Protocol (server → client): `WXL_TINT PUSH\t<ownerGuid>\t<slot>\t…`  
-Protocol (client → server): `WXL_TINT SET|CLEAR\t…` on Apply from transmog tints tab or `/recolor`.
+Protocol (server → client): `WXL_TINT PUSH\t<ownerGuid>\tslot\t…`  
+Protocol (client → server): `WXL_TINT SET|CLEAR|REQ\t…` (`REQ` = re-PUSH all equipped after `/reload` / enter-world settle)
 
 ---
 
@@ -93,13 +93,40 @@ Protocol (client → server): `WXL_TINT SET|CLEAR\t…` on Apply from transmog t
 
 **Known limitation:** Character select, dressing room, and default paperdoll **do not show tints correctly** (intentionally left broken until we have a safe separate preview path).
 
+### 3) `/reload` drops some textureitem tints — **fixed**
+
+**Symptom:** After `/reload`, some slots lost their tint until full client restart / relog.
+
+**Cause:** `/reload` does **not** fire `PLAYER_ENTERING_WORLD`. The DLL stays loaded (`g_slotHsl` OK) but UI reload swaps BLP handles; `g_texTint` stayed keyed to stale pointers. The server also never re-PUSHed (login-only).
+
+**Fix:**
+- `WXL_RecolorOnUiReload()` — drop stale tex handles, invalidate body `g_pathOrig`, rebuild tinted sections
+- `SetSelfGuid` clears local HSL only on **character switch**, not same-guid reload
+- Addon recovery: after `/reload` send `WXL_TINT REQ`; server re-`PushAllEquipped` + nearby sync
+- Enter-world also schedules delayed `REQ` + rebuild (same handshake)
+
+### 4) Cold login: no tints until unequip/reequip — **fixed**
+
+**Symptom:** Close/reopen client, enter world → own gear untinted until bag swap.
+
+**Cause:** Login `PUSH` often arrived **before** `SetSelfGuid`. `ApplyOwnerTint` stored rows in `g_remoteTints` (self was still 0). Local paste only reads `g_slotHsl` → invisible. Unequip/equip sent a fresh PUSH with self set → worked.
+
+**Fix:** `PromoteRemoteTintsToLocal()` on `SetSelfGuid` + delayed enter-world `REQ` / equip-snap / section rebuild.
+
+### 5) Other players' faces / underwear pick up *your* textureitem tint (after relog) — **fixed**
+
+**Symptom:** Apply a textureitem tint; others look fine. Logout/login → from your client, other players' **faces / underwear / similar layers** show **your** tint color.
+
+**Cause:** Post-relog, many `TextureComponents` pastes run with `prepOwner=0`. `ResolveOrphanPasteOwner` scanned **all** tinted owners **including self first**. Your HSL was painted into **other units' composites** whenever the BLP stem matched your ItemDisplayInfo (shared gear paths / section rebuild). Looked similar to bug (1) but milder and delayed until reassemble.
+
+**Fix:** Orphan resolution **never considers self**. Local tints apply only via RenderPrep / `TryHslForComponentTexture` when prep is the local player. Remotes keep orphan + match fallbacks so **their** tints still show (without stealing yours).
+
 ---
 
 ## Known issues
 
 | Issue | Notes |
 |---|---|
-| **`/reload`** | Can leave some body textures in a bad state; needs investigation |
 | **Transmog Tints tab** | Less tint variety than `/recolor` (gradients, selective, etc.); will improve |
 | **`/recolor` addon** | May be removed once transmog tints tab is feature-complete |
 | **Paperdoll / glue / `C` panel** | No tint preview (see NPC bug workaround) |
