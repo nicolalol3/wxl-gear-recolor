@@ -48,7 +48,8 @@
                             const uint32_t mask = TakeRemotePendingMask(remoteOwner);
                             if (mask)
                             {
-                                SetComponentSectionDirtyReplaceSeh(component, mask);
+                                // OR, never Replace — cold dual-login black face.
+                                SetComponentSectionDirtySeh(component, mask);
                                 g_forceAllowPaste.store(true, std::memory_order_relaxed);
                             }
                         }

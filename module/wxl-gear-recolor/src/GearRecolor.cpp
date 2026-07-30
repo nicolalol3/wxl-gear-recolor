@@ -303,6 +303,9 @@ namespace
     std::unordered_map<void*, void*> g_modelToComponent;
     // Remote tint arrived before unit visible — section mask to Force on next prep.
     std::unordered_map<OwnerGuid, uint32_t> g_remotePendingDirty;
+    // First CharComponent assemble for a remote must run untinted (face/skin).
+    // Tinting during that pass paints item HSL onto face-adjacent composite layers.
+    std::unordered_map<OwnerGuid, uint8_t> g_remoteNativeAssembleDone;
     // CharComponent assemble owner for the current paste window.
     std::atomic<OwnerGuid> g_prepOwnerGuid{ 0 };
 
@@ -627,6 +630,14 @@ namespace
                     g_remoteTints.erase(it);
                     g_remoteCcModels.erase(owner);
                     g_remoteCcComponents.erase(owner);
+                    for (auto jt = g_remoteNativeAssembleDone.begin();
+                        jt != g_remoteNativeAssembleDone.end(); )
+                    {
+                        if (GuidSamePlayer(jt->first, owner))
+                            jt = g_remoteNativeAssembleDone.erase(jt);
+                        else
+                            ++jt;
+                    }
                 }
                 else if (slot < kMaxEquipSlots)
                 {
@@ -636,6 +647,14 @@ namespace
                         g_remoteTints.erase(it);
                         g_remoteCcModels.erase(owner);
                         g_remoteCcComponents.erase(owner);
+                        for (auto jt = g_remoteNativeAssembleDone.begin();
+                            jt != g_remoteNativeAssembleDone.end(); )
+                        {
+                            if (GuidSamePlayer(jt->first, owner))
+                                jt = g_remoteNativeAssembleDone.erase(jt);
+                            else
+                                ++jt;
+                        }
                     }
                 }
             }
@@ -664,6 +683,7 @@ namespace
         g_remoteCcModels.clear();
         g_remoteCcComponents.clear();
         g_remotePendingDirty.clear();
+        g_remoteNativeAssembleDone.clear();
     }
 
     bool IsIdentityHsl(const SlotHsl& h)
@@ -1613,6 +1633,10 @@ namespace
     std::atomic<uint32_t> g_naturalTintPastes{ 0 };
     std::atomic<bool> g_forceAllowPaste{ false };
     std::atomic<bool> g_assemblingAllowed{ false };
+    // Blocks orphan/force remote tint during deferred first-assemble (face bleed).
+    // Outside that window orphan must work: most TextureComponents pastes have
+    // prepOwner=0 and remotes only get color via ResolveOrphanPasteOwner.
+    std::atomic<bool> g_suppressOrphanTint{ false };
     std::atomic<OwnerGuid> g_forceOwnerGuid{ 0 };
     std::atomic<void*> g_prepModel{ nullptr };
     std::atomic<uint32_t> g_prepReasonCode{ 0 };
@@ -1984,6 +2008,35 @@ namespace
         g_remotePendingDirty[owner] |= sectionMask;
     }
 
+    bool IsRemoteNativeAssembleDone(OwnerGuid owner)
+    {
+        if (!owner)
+            return false;
+        std::lock_guard<std::mutex> lock(g_remoteMu);
+        for (const auto& kv : g_remoteNativeAssembleDone)
+        {
+            if (GuidSamePlayer(kv.first, owner) && kv.second)
+                return true;
+        }
+        return false;
+    }
+
+    void MarkRemoteNativeAssembleDone(OwnerGuid owner)
+    {
+        if (!owner)
+            return;
+        std::lock_guard<std::mutex> lock(g_remoteMu);
+        for (auto& kv : g_remoteNativeAssembleDone)
+        {
+            if (GuidSamePlayer(kv.first, owner))
+            {
+                kv.second = 1;
+                return;
+            }
+        }
+        g_remoteNativeAssembleDone[owner] = 1;
+    }
+
     void RememberRemoteCc(OwnerGuid owner, void* component, void* model)
     {
         if (!owner || (!component && !model))
@@ -2041,14 +2094,29 @@ namespace
     uint32_t ActiveRemoteSectionMask(OwnerGuid owner)
     {
         uint32_t mask = 0;
+        if (!owner)
+            return 0;
         std::lock_guard<std::mutex> lock(g_remoteMu);
-        auto it = g_remoteTints.find(owner);
-        if (it != g_remoteTints.end())
+        auto accumulate = [&](const OwnerSlotHsl& slots)
         {
             for (int s = 0; s < kMaxEquipSlots; ++s)
             {
-                if (it->second[static_cast<size_t>(s)].active)
+                if (slots[static_cast<size_t>(s)].active)
                     mask |= SectionMaskForEquipSlot(s);
+            }
+        };
+        auto it = g_remoteTints.find(owner);
+        if (it != g_remoteTints.end())
+        {
+            accumulate(it->second);
+            return mask;
+        }
+        for (const auto& kv : g_remoteTints)
+        {
+            if (GuidSamePlayer(kv.first, owner))
+            {
+                accumulate(kv.second);
+                break;
             }
         }
         return mask;
@@ -2549,8 +2617,9 @@ namespace
     void FlushPendingRemoteApplies()
     {
         // Login PUSH often arrives before CharComponent exists (force hasComp:0).
-        // pending_force never fired in logs — retry here once the unit is visible,
-        // Force per active tint slot (never OR'd mega-mask).
+        // Once visible + first native assemble done: OR gear dirty bits only.
+        // Never REPLACE (wipes face dirty). Never OR into a still-wide 0x3FF
+        // first-assemble — that would re-enter tint on the same wide pass.
         std::vector<OwnerGuid> owners;
         {
             std::lock_guard<std::mutex> lock(g_remoteMu);
@@ -2563,14 +2632,20 @@ namespace
         }
         for (OwnerGuid owner : owners)
         {
+            if (!IsRemoteNativeAssembleDone(owner))
+                continue;
             void* unitModel = nullptr;
             void* component = FindOwnerCharComponent(owner, &unitModel);
             if (!component)
                 continue;
+            const uint32_t curDirty = SafeReadU32(component, kOffComponentSectionDirty);
+            constexpr uint32_t kGearSectionBits = 0xFFu;
+            if ((curDirty & ~kGearSectionBits) != 0)
+                continue;
             const uint32_t pending = TakeRemotePendingMask(owner);
             if (!pending)
                 continue;
-            SetComponentSectionDirtyReplaceSeh(component, pending);
+            SetComponentSectionDirtySeh(component, pending);
         }
     }
 
@@ -2665,6 +2740,8 @@ namespace
         const bool isNpc = ComponentIsNpc(component);
         const char* reason = "deny";
         const OwnerGuid self = ActiveOwnerGuid();
+        bool markRemoteNativeAfter = false;
+        OwnerGuid markRemoteOwner = 0;
 
         if (component && model && !isNpc)
             RememberModelComponent(model, component);
@@ -2697,17 +2774,48 @@ namespace
                     const bool hasTint = OwnerHasAnyRemoteTint(remoteOwner);
                     if (hasTint || pending)
                     {
-                        allowed = true;
-                        reason = "remote";
-                        g_prepOwnerGuid.store(remoteOwner, std::memory_order_relaxed);
-                        RememberRemoteCc(remoteOwner, component, model);
-                        if (pending)
+                        // Gear sections use bits 0..7. First-create dirty is often
+                        // 0x3FF (includes 8..9). Tinting during that pass paints
+                        // item HSL onto face/skin composite (cold dual-login).
+                        const uint32_t curDirty = SafeReadU32(
+                            component, kOffComponentSectionDirty);
+                        constexpr uint32_t kGearSectionBits = 0xFFu;
+                        const bool wideAssemble =
+                            (curDirty & ~kGearSectionBits) != 0;
+                        const bool nativeDone =
+                            IsRemoteNativeAssembleDone(remoteOwner);
+
+                        if (wideAssemble || !nativeDone)
                         {
-                            const uint32_t mask = TakeRemotePendingMask(remoteOwner);
-                            if (mask)
+                            RememberRemoteCc(remoteOwner, component, model);
+                            if (hasTint)
                             {
-                                SetComponentSectionDirtyReplaceSeh(component, mask);
-                                g_forceAllowPaste.store(true, std::memory_order_relaxed);
+                                const uint32_t need =
+                                    ActiveRemoteSectionMask(remoteOwner);
+                                if (need)
+                                    OrRemotePendingMask(remoteOwner, need);
+                            }
+                            markRemoteNativeAfter = true;
+                            markRemoteOwner = remoteOwner;
+                        }
+                        else
+                        {
+                            allowed = true;
+                            reason = "remote";
+                            g_prepOwnerGuid.store(remoteOwner,
+                                std::memory_order_relaxed);
+                            RememberRemoteCc(remoteOwner, component, model);
+                            if (pending)
+                            {
+                                const uint32_t mask =
+                                    TakeRemotePendingMask(remoteOwner);
+                                if (mask)
+                                {
+                                    // OR, never Replace — preserves non-gear dirty.
+                                    SetComponentSectionDirtySeh(component, mask);
+                                    g_forceAllowPaste.store(true,
+                                        std::memory_order_relaxed);
+                                }
                             }
                         }
                     }
@@ -2735,7 +2843,10 @@ namespace
             }
         }
 
-        g_prepModel.store(model, std::memory_order_relaxed);
+        if (allowed)
+            g_prepModel.store(model, std::memory_order_relaxed);
+        else
+            g_prepModel.store(nullptr, std::memory_order_relaxed);
         if (!allowed)
             g_prepOwnerGuid.store(0, std::memory_order_relaxed);
 
@@ -2753,12 +2864,19 @@ namespace
 
         ReProbeRenderPrep(component, model, a2, isNpc, reason, allowed, self, playerModel);
 
+        if (markRemoteNativeAfter)
+            g_suppressOrphanTint.store(true, std::memory_order_relaxed);
         const int rc = CallOrigRenderPrepSeh(component, a2);
+        if (markRemoteNativeAfter)
+            g_suppressOrphanTint.store(false, std::memory_order_relaxed);
         g_forceAllowPaste.store(false, std::memory_order_relaxed);
         g_assemblingAllowed.store(false, std::memory_order_relaxed);
         g_prepModel.store(nullptr, std::memory_order_relaxed);
         g_prepOwnerGuid.store(0, std::memory_order_relaxed);
         g_prepReasonCode.store(0, std::memory_order_relaxed);
+
+        if (markRemoteNativeAfter && markRemoteOwner)
+            MarkRemoteNativeAssembleDone(markRemoteOwner);
 
         if (allowed && component && AnySlotActive()
             && g_pendingEnterWorldRebuild.load(std::memory_order_relaxed)
@@ -3009,8 +3127,12 @@ namespace
 
     // Stem match for one owner (no RenderPrep context required).
     // Same rules for self and remotes — tint + (display stem OR component→slot).
+    // allowStemlessFallback: folder heuristics when display snap lags — ONLY safe
+    // when caller already bound this owner (TryHsl with prepOwner). Orphan must
+    // pass false or face/underwear layers pick up item HSL on cold dual-login.
     bool MatchComponentTextureForOwner(OwnerGuid owner, const char* name,
-        int pasteSection, SlotHsl& out, int& outSlot)
+        int pasteSection, SlotHsl& out, int& outSlot,
+        bool allowStemlessFallback = false)
     {
         owner = CanonicalTintOwner(owner);
         if (!owner || !name || !IsItemComponentTexture(name))
@@ -3066,10 +3188,7 @@ namespace
                 consider(slotCands[si], 0, true);
         }
 
-        // Last resort (identical for self and remotes): tinted slot by component
-        // folder when display stems lag (tmog / observer PUSH). Caller still binds
-        // a single owner — does not reintroduce cross-owner bleed.
-        if (bestSlot < 0)
+        if (bestSlot < 0 && allowStemlessFallback)
         {
             int slotCands[4];
             int nSlotCands = 0;
@@ -3137,7 +3256,8 @@ namespace
                 continue;
             SlotHsl hsl{};
             int slot = -1;
-            if (!MatchComponentTextureForOwner(owner, name, pasteSection, hsl, slot))
+            if (!MatchComponentTextureForOwner(owner, name, pasteSection, hsl, slot,
+                false))
                 continue;
             const int pathComp = ComponentIndexFromTexturePath(name);
             int compIdx = pathComp;
@@ -3180,7 +3300,8 @@ namespace
         }
 
         int slot = -1;
-        if (!MatchComponentTextureForOwner(owner, name, pasteSection, out, slot))
+        // Bound prepOwner: stemless fallback OK. Orphan path passes false.
+        if (!MatchComponentTextureForOwner(owner, name, pasteSection, out, slot, true))
             return false;
         if (outSlot)
             *outSlot = slot;
@@ -4195,9 +4316,11 @@ namespace
                 int slot = -1;
                 bool hasHsl = TryHslForComponentTexture(name, section, hsl, &slot);
                 bool orphanTint = false;
-                // Orphan never uses self (ResolveOrphanPasteOwner). Same fallback for
-                // every other owner: prep unbound, or prep matches the found remote.
-                if (!hasHsl)
+                // Orphan never uses self. Most remote pastes have prepOwner=0 — orphan
+                // is required for observer tint. Suppress only during deferred first
+                // assemble (g_suppressOrphanTint) so face/skin stay clean.
+                if (!hasHsl
+                    && !g_suppressOrphanTint.load(std::memory_order_relaxed))
                 {
                     OwnerGuid found = 0;
                     SlotHsl foundHsl{};
@@ -4228,11 +4351,13 @@ namespace
                 }
 
                 const OwnerGuid self = ActiveOwnerGuid();
-                if (hasHsl && !allow && effectiveOwner != 0
+                if (!g_suppressOrphanTint.load(std::memory_order_relaxed)
+                    && hasHsl && !allow && effectiveOwner != 0
                     && !(self && GuidSamePlayer(effectiveOwner, self)))
                 {
                     // Remote tint matched but IsPasteTintAllowed failed — same
-                    // force path self gets via assembling RenderPrep.
+                    // force path self gets via assembling RenderPrep. Blocked
+                    // during deferred first-assemble via g_suppressOrphanTint.
                     orphanTint = true;
                     allow = true;
                 }

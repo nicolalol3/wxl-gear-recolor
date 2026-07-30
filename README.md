@@ -121,6 +121,31 @@ Protocol (client → server): `WXL_TINT SET|CLEAR|REQ\t…` (`REQ` = re-PUSH all
 
 **Fix:** Orphan resolution **never considers self**. Local tints apply only via RenderPrep / `TryHslForComponentTexture` when prep is the local player. Remotes keep orphan + match fallbacks so **their** tints still show (without stealing yours).
 
+### 6) Cold dual-login: remote face black → then item-colored; gear tint must survive — **fixed Jul 2026**
+
+**Symptom:** With both clients already logged in, remote *textureitem* tints look correct. `/reload`, single-client relog, or reopening only one client stays fine. But if **both** clients are fully closed and reopened together, observers see the other player’s **face / body layers** broken: first as **black**, and after an intermediate fix attempt as **painted with the gear tint color**. Live Apply while both are online never hit this.
+
+**Why both clients must cold-start:** Each observer’s client builds the remote `CharComponent` for the first time while login `PUSH` tint data is already present. A warm client usually finishes the remote’s native full assemble *before* pending tint dirties sections, so Replace≈OR and the race never fires. Simultaneous cold start lines up create-model + tint PUSH on the first assemble.
+
+**Actual cause (layered — same family as bugs 1 and 5):**
+
+1. **`SetComponentSectionDirtyReplaceSeh` on remote pending** — Login PUSH → `OrRemotePendingMask` → `FlushPendingRemoteApplies` / `hkRenderPrep` **replaced** the CharComponent dirty mask with gear-only bits (e.g. chest `0|1|3|4`). During cold first-assemble the engine had already set a wide dirty (often `0x3FF` including face/skin bits). REPLACE wiped those bits → RenderPrep never re-pasted the face → **black**.
+
+2. **Tint armed during that same first assemble** — Switching REPLACE→OR preserved face dirty (no more black), but remote `RenderPrep` still set `prepOwner` / assembling / orphan force-allow for the whole wide pass. Item HSL was applied while face/skin composites were still being laid → **face took the gear tint color**.
+
+3. **Orphan paste bypass** — Most `TextureComponents` pastes run with `prepOwner=0`. `ResolveOrphanPasteOwner` + “force allow when remote HSL matched but `IsPasteTintAllowed` failed” still tinted during the deferred “native” pass. Deferring `allowed=false` alone did nothing until orphan was gated.
+
+4. **Over-tight orphan (regression)** — Requiring `prepModel == OwnerBodyModel(found)` for every orphan tint **fixed the face** but killed observer *textureitem* color: remotes depend on orphan when `prepOwner=0` (see bug 1). Stemless folder matching in orphan also helped paint wrong layers when display stems lagged.
+
+**Fix (final):**
+
+- Remote pending dirty uses **OR** (`SetComponentSectionDirtySeh`), never REPLACE (self Force still may Replace).
+- **Defer remote tint** on first/wide assemble (`wide` dirty outside gear bits `0xFF`, or `!g_remoteNativeAssembleDone`): leave assemble native, queue gear pending, mark native done after `CallOrigRenderPrep`, then `FlushPendingRemoteApplies` ORs gear-only dirty for a later tinted prep.
+- During that deferred native call, set **`g_suppressOrphanTint`** so orphan + remote force-allow cannot paint HSL into the first composite.
+- Outside suppress: **restore orphan** (still never considers self; stem match required) so remote *textureitems* show again.
+- Stemless MatchComponent fallback only inside **`TryHslForComponentTexture`** (bound `prepOwner`); orphan always `requireStem`.
+- `g_prepModel` is set only when tint assemble is actually `allowed`.
+
 ---
 
 ## Known issues
