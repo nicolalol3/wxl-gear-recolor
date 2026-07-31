@@ -1,0 +1,43 @@
+WXL RE — Face dstMips pool collision (2026-07-31)
+=================================================
+
+## Evidenza log (debug-615e3b.log, script wxl_analyze_face_collisions.py)
+
+18 dst `ptr` values received face_skin_ok pastes from **multiple races**
+(Orc + BloodElf + other) within the same assemble window (ms apart).
+
+Example ptr=550938888 @ ts 2690604796:
+  - OrcMaleFaceUpper/Lower
+  - then @ 2690604812 BloodElfFemaleFace + Scalp (16ms later)
+
+Same composite mip object reused across CharComponent pool entries before
+RefCountCompositeMip @ FlushGearComposite (0x4E9000) splits per-unit mips.
+
+## Conseguenza in-game
+
+- Player A face pasted to mip object X
+- Player B face pasted to same mip object X (pool recycle)
+- Both components may still reference X → wrong face / tinted bleed
+
+## face_gear_block (REVERT)
+
+Native section 8 handler @ 0x4F0AD0 intentionally pastes item gear
+(bracer/glove) onto face composite layer THEN face skin. Blocking
+PasteToSection for IsItemComponentTexture on sec 8-9 leaves composite
+incomplete → black self face + unstable mip state for remotes.
+
+WXL must NOT block native face gear paste. Tint HSL on 8-9 already blocked
+(gearLayer = sections 0-7 only).
+
+## Fix direction (client-aligned)
+
+1. Let native complete face composite (no face_gear_block)
+2. ~~Call FlushGearComposite after each tint RenderPrep~~ **REVERTED — client crash**
+   (native already flushes; double RefCountCompositeMip inside paste gate)
+3. Self: deferred ScheduleOwnerSectionRebuild(0x300) **once after enter-world**
+   gear tint — NOT every local frame (also crashed)
+
+## Mip fields (FlushGearComposite @ 0x4E9000)
+
+RefCountCompositeMip on [esi+0x194, +0x1A4, +0x1B0, +0x1C0] — gear path
+Variant uses +0x1A0, +0x1AC for section 9.

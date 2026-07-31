@@ -1,0 +1,108 @@
+WXL RE — Face nera self (root cause, 2026-07-31)
+=================================================
+
+## Sintomo
+- Gear tint OK (sezioni 0-7)
+- Ogni client vede la PROPRIA faccia nera; facce remote OK
+- face_gear_block non basta: faccia ancora nera
+
+## Evidenza log (debug-615e3b.log)
+
+| Pattern | Self (local) | Remote |
+|---------|--------------|--------|
+| pasteStrictOk @ hkRenderPrep | **0** (dirty mask vuota) | **1023** (0x3FF tutte sezioni) |
+| face_skin_ok in mondo | **MAI** con owner tint attivo | Sì, dopo stem_tint |
+| skin_layout (PasteSkinLayout sec 8-9) | **0 righe** in tutto il log | — |
+| face_gear_native / block | gear su sec 8-9 (bloccato ora) | stesso path |
+
+Conclusione: il rebuild gear del self entra in RenderPrep **senza bit 8-9 dirty**.
+RenderPrepSections @ 0x4EE0D0 salta i handler faccia.
+FlushGearComposite @ 0x4E9000 tocca comunque i mip faccia (+0x1A4, +0x1B0).
+
+## Pipeline client (static RE Wow 3.3.5a)
+
+### RenderPrep inner @ 0x4F14A0
+```
+call 0x4ED900
+call 0x4EFF10
+call 0x4EE0D0   ; RenderPrepSections
+call 0x4E7650
+```
+
+### RenderPrepSections @ 0x4EE0D0
+- edi = CCharacterComponent
+- Loop ebx=0..9: se ([edi+0x0C] & (1<<ebx)) → call [table+ebx*4]
+- Tabella runtime @ 0x00B6B88C (copiata da 0x00B6B928 all'init @ 0x4F1BA2)
+
+### Section 8 handler @ 0x4F0AD0
+```
+TextureCacheHelper
+PasteSkinLayout(8) → scratch *[B6B870]
+PasteFromSkin → [esi+0x1A4], [esi+0x1B0], scratch
+```
+
+### FlushGearComposite @ 0x4E9000
+RefCountCompositeMip su:
+- [esi+0x194], [esi+0x1A4], [esi+0x1B0], [esi+0x1C0]  (variante gear)
+- [esi+0x194], [esi+0x1A0], [esi+0x1AC]              (variante sec 9)
+
+Gear paste usa solo scratch B6B870 (sez 0-7).
+Faccia usa mip per-component — ma flush refcount li aggiorna lo stesso.
+
+## Root cause
+1. Self salta `local_native_first` (nativeDone=true dopo primo enter)
+2. Rebuild tint imposta solo dirty gear (0-7), mai 8-9
+3. Handler faccia non gira → mip faccia restano invalidi post-flush gear
+4. Remote primo assemble ha dirty=0x3FF → face_skin_ok + stem_tint insieme
+
+## Fix WXL (evidence-based)
+
+**CRASH if OR dirty 0x300 inside same CallOrig as gear** — native runs sec 8
+handler while scratch B6B870 still holds tinted gear from sec 0-7.
+
+**SAFE: separate face-only RenderPrep** (dirty mask = 0x300 only):
+- `ScheduleOwnerSectionRebuild(self, 0x300)` after first self gear tint pass
+- Coalesce 32ms → `ForceOwnerBodyRebuild(self, 0x300)` → `hkRenderPrep` top-level
+- Must NOT call `LightSelfSectionRefresh` nested inside gear `RenderPrep`
+- Must NOT double-call `FlushGearComposite` after prep (crash)
+
+Log markers: `self_face_done`, `skin_layout` for self.
+
+## /recolor regression (2026-07-31 log)
+
+- Login perfect: native_first → pasteStrictOk 0x3FF → face+gear together
+- face_schedule x6 but self_face_done x0: coalesce never ran ForceOwnerBodyRebuild
+  (preview UI used LightSelfSectionRefresh for 0x300 — wrong path)
+- /recolor opens preview → remote_snap storm → interleaved 0x3FF remote rebuilds
+  → tint bleed B/C on shared scratch pool
+
+Fixes:
+- RunSelfFaceRebuildNow(component known) immediately after gear tint
+- Face-only mask always ForceOwnerBodyRebuild, never LightSelfSectionRefresh
+- Defer remote tint allowed while g_previewUiActive; flush on preview close
+- g_sessionTeardown bypass hooks on logout (LuaRecolorFlushTex)
+
+## Instrumentazione
+
+## Dual-path section 8 (2026-07-31 disasm)
+
+Handler @ 0x4F0AD0 — vedi WXL-RE-SECT8-DUAL-PATH.txt:
+
+```
+TextureCacheHelper @ 0x4F3BA0
+if !eax → ret
+test byte [eax+0x1C], 0x08 → jz 0x4F0B15   ; SKIP layout
+call PasteSkinLayout(8) @ 0x4F07D0         ; layout path only
+0x4F0B15: PasteFromSkin → [esi+0x1A4/+0x1B0/+0x1C0]
+```
+
+**skin_layout=0 nel log NON significa handler 8 saltato.**
+Il client usa spesso il percorso diretto (solo PasteFromSkin).
+WXL logga skin_layout solo su 0x4F07D0; face_skin_ok su 0x4F08A0 (entrambi i path).
+
+## Fix sessione corrente (evidence log)
+
+- `g_selfFaceRebuildQueued` one-shot: dopo 1° gear tint, faccia non ripastata → nera.
+  Rimosso: `RunSelfFaceRebuildNow(..., true)` dopo OGNI pass gear self local.
+- Remote: `g_remoteAssembleMu` serializza RenderPrep tint (no più preview defer).
+- `face_skin_ok.ptr` ora è dstMips reale, non CharComponent.

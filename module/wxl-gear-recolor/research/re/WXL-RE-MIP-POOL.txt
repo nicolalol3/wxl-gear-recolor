@@ -1,0 +1,272 @@
+WXL RE — Composite mip pool + FlushGearComposite
+Binary: C:\Users\Shadowlands\Desktop\WotLK for AZ\Wow.exe
+========================================================================
+
+## 1. FlushGearComposite @ 0x4E9000
+  Called after RenderPrepSections; touches gear AND face mip fields.
+  0x004E9000: mov eax, [0x00B6B864]
+  0x004E9005: 6A
+  0x004E9006: 00
+  0x004E9007: 6A
+  0x004E9008: 00
+  0x004E9009: 51
+  0x004E900A: 52
+  0x004E900B: 50
+  0x004E900C: call 0x004F3BA0
+  0x004E9011: 83
+  0x004E9012: C4
+  0x004E9013: 1C
+  0x004E9014: 85
+  0x004E9015: C0
+  0x004E9016: 74
+  0x004E9017: 1E
+  0x004E9018: F6
+  0x004E9019: 40
+  0x004E901A: 1C
+  0x004E901B: 08
+  0x004E901C: 74
+  0x004E901D: 18
+  0x004E901E: mov eax, [esi+0x194]  ; face/gear mip +0x194
+  0x004E9024: 8B
+  0x004E9025: BE
+  0x004E9026: 2C
+  0x004E9027: 05
+  0x004E9028: 00
+  0x004E9029: 00
+  0x004E902A: 50
+  0x004E902B: call 0x004F2CE0
+  0x004E9030: 83
+  0x004E9031: C4
+  0x004E9032: 04
+  0x004E9033: 89
+  0x004E9034: 47
+  0x004E9035: 2C
+  0x004E9036: mov eax, [esi+0x1A4]  ; face/gear mip +0x1A4
+  0x004E903C: 85
+  0x004E903D: C0
+  0x004E903E: 74
+  0x004E903F: 2B
+  0x004E9040: 8B
+  0x004E9041: BE
+  0x004E9042: 2C
+  0x004E9043: 05
+  0x004E9044: 00
+  0x004E9045: 00
+  0x004E9046: 83
+  0x004E9047: 7F
+  0x004E9048: 34
+  0x004E9049: 28
+  0x004E904A: 73
+  0x004E904B: 1F
+  0x004E904C: 50
+  0x004E904D: call 0x004F2CE0
+  0x004E9052: 8B
+  0x004E9053: 4F
+  0x004E9054: 34
+  0x004E9055: 89
+  0x004E9056: 44
+  0x004E9057: 8F
+  0x004E9058: 38
+  0x004E9059: 8B
+  0x004E905A: 57
+  0x004E905B: 34
+  0x004E905C: 83
+  0x004E905D: C4
+  0x004E905E: 04
+  0x004E905F: C6
+  0x004E9060: 84
+  0x004E9061: 17
+  0x004E9062: D8
+  0x004E9063: 00
+  0x004E9064: 00
+  0x004E9065: 00
+  0x004E9066: 08
+  0x004E9067: 83
+  0x004E9068: 47
+  0x004E9069: 34
+  0x004E906A: 01
+  0x004E906B: mov eax, [esi+0x1B0]  ; face/gear mip +0x1B0
+  0x004E9071: 85
+  0x004E9072: C0
+  0x004E9073: 74
+  0x004E9074: 2B
+  0x004E9075: 8B
+  0x004E9076: BE
+  0x004E9077: 2C
+  0x004E9078: 05
+  0x004E9079: 00
+  0x004E907A: 00
+  0x004E907B: 83
+  0x004E907C: 7F
+  0x004E907D: 34
+  0x004E907E: 28
+  0x004E907F: 73
+  0x004E9080: 1F
+  0x004E9081: 50
+  0x004E9082: call 0x004F2CE0
+  0x004E9087: 8B
+  0x004E9088: 4F
+  0x004E9089: 34
+  0x004E908A: 89
+  0x004E908B: 44
+  0x004E908C: 8F
+  0x004E908D: 38
+  0x004E908E: 8B
+  0x004E908F: 57
+  0x004E9090: 34
+  0x004E9091: 83
+  0x004E9092: C4
+  0x004E9093: 04
+  0x004E9094: C6
+  0x004E9095: 84
+  0x004E9096: 17
+  0x004E9097: D8
+  0x004E9098: 00
+  0x004E9099: 00
+  0x004E909A: 00
+
+## 2. RefCountCompositeMip @ 0x4E9BA0 (first 0x100 bytes)
+  0x004E9BA0: 55
+  0x004E9BA1: 8B
+  0x004E9BA2: EC
+  0x004E9BA3: 83
+  0x004E9BA4: EC
+  0x004E9BA5: 1C
+  0x004E9BA6: 53
+  0x004E9BA7: 56
+  0x004E9BA8: 57
+  0x004E9BA9: call 0x0086BB80
+  0x004E9BAE: 8B
+  0x004E9BAF: 35
+  0x004E9BB0: FC
+  0x004E9BB1: B5
+  0x004E9BB2: B6
+  0x004E9BB3: 00
+  0x004E9BB4: 8B
+  0x004E9BB5: 0D
+  0x004E9BB6: F4
+  0x004E9BB7: B4
+  0x004E9BB8: B6
+  0x004E9BB9: 00
+  0x004E9BBA: 83
+  0x004E9BBB: E0
+  0x004E9BBC: 14
+  0x004E9BBD: 3C
+  0x004E9BBE: 14
+  0x004E9BBF: 0F
+  0x004E9BC0: 85
+  0x004E9BC1: C0
+  0x004E9BC2: 00
+  0x004E9BC3: 00
+  0x004E9BC4: 00
+  0x004E9BC5: 85
+  0x004E9BC6: C9
+  0x004E9BC7: 89
+  0x004E9BC8: 75
+  0x004E9BC9: FC
+  0x004E9BCA: C7
+  0x004E9BCB: 45
+  0x004E9BCC: call 0x004E9BD1
+  0x004E9BD1: 0F
+  0x004E9BD2: 86
+  0x004E9BD3: 67
+  0x004E9BD4: 01
+  0x004E9BD5: 00
+  0x004E9BD6: 00
+  0x004E9BD7: 8B
+  0x004E9BD8: 7D
+  0x004E9BD9: 0C
+  0x004E9BDA: 8B
+  0x004E9BDB: 45
+  0x004E9BDC: 08
+  0x004E9BDD: 2B
+  0x004E9BDE: C7
+  0x004E9BDF: 89
+  0x004E9BE0: 7D
+  0x004E9BE1: F8
+  0x004E9BE2: 89
+  0x004E9BE3: 45
+  0x004E9BE4: F4
+  0x004E9BE5: 83
+  0x004E9BE6: FE
+  0x004E9BE7: 04
+  0x004E9BE8: 7D
+  0x004E9BE9: 16
+  0x004E9BEA: 8B
+  0x004E9BEB: 07
+  0x004E9BEC: 8B
+  0x004E9BED: 55
+  0x004E9BEE: 08
+  0x004E9BEF: 8B
+  0x004E9BF0: 4C
+  0x004E9BF1: 8A
+  0x004E9BF2: F8
+  0x004E9BF3: 50
+  0x004E9BF4: 6A
+  0x004E9BF5: 10
+  0x004E9BF6: call 0x004E7030
+  0x004E9BFB: 83
+  0x004E9BFC: C4
+  0x004E9BFD: 08
+  0x004E9BFE: EB
+  0x004E9BFF: 5C
+  0x004E9C00: 8B
+  0x004E9C01: 4D
+  0x004E9C02: F4
+  0x004E9C03: 8B
+  0x004E9C04: C6
+  0x004E9C05: 99
+  0x004E9C06: 83
+  0x004E9C07: E2
+  0x004E9C08: 03
+  0x004E9C09: 03
+  0x004E9C0A: retn 63681
+
+## 3. Callers of RefCountCompositeMip
+  0x004EE165
+  0x004EE326
+  0x004F0F65
+
+## 4. Sites that WRITE [esi+0x1A4] (face upper mip ptr)
+
+## 5. Sites that WRITE [esi+0x1B0] (face lower mip ptr)
+
+## 6. CharComponent pool @ 0xB6B240 — code refs (first 15)
+  0x004D98B9
+  0x004D9A67
+  0x004D9BFE
+  0x004DA163
+  0x004DA216
+  0x004E1B8B
+  0x004E27F0
+  0x004E2843
+  0x004E288B
+  0x004E291C
+  0x004E2974
+  0x004E298A
+  0x004E299F
+  0x004E29AF
+  0x004E29FF
+
+## 7. RECOLOR REGRESSION — client model (from log + RE)
+
+  LOGIN OK:
+    - Each player: 1 native RenderPrep, dirty often 0x3FF
+    - Face mips assigned per CharComponent; few cross-race ptr reuse
+
+  AFTER /recolor:
+    - PUSH storm → ApplyOwnerTint → remote RenderPrep dirty=0x3FF
+    - remote_miss×1032: allowed=0 BUT CallOrig still runs (no tint ctx)
+    - scratch B6B870: SINGLETON — last gear tint visible to next unit
+    - face ptr collisions 3→55: same dstMips across Orc/BElf/BE races
+    - Handler sec8 layout path: PasteFromSkin(scratch→+0x1A4) uses B6B870
+
+  SELF black face after recolor:
+    - self_face_done×125 runs but gear-only passes still use dirty 0-7
+    - FlushGearComposite @ end of gear prep invalidates +0x1A4/+0x1B0
+    - Separate face prep may target POOL component not live render slot
+
+  WXL must NOT patch blindly; fix requires:
+    A) Serialize: one assemble owner at a time + clear B6B870 before each
+    B) Never CallOrig 0x3FF remote without owner paste context
+    C) Face rebuild on LIVE component from model render, not stale pool CC

@@ -1,0 +1,159 @@
+WXL Remote Recolor — Session Log (living document)
+
+===================================================
+
+Updated: 2026-07-29 ~16:20 UTC+2 — REMOTE OBSERVER BUG **SOLVED**
+
+
+
+======================================================================
+
+★★★ SOLVED — Observer tint bug (self OK, other player face/body broke) ★★★
+
+======================================================================
+
+
+
+WHAT THE USER SAW
+
+  Apply tint on client A → looks correct on A.
+
+  Observer client B → tint briefly or on chest only, then face/body corrupted.
+
+
+
+ROOT CAUSE (multi-part — all required for the fix)
+
+
+
+  1) PASTE OUTSIDE RENDERPREP WINDOW
+
+     Most TextureComponents pastes run with prepOwner=0 (no assemble context).
+
+     Tint logic never ran → orphan pastes mixed paladin/shaman composites.
+
+
+
+  2) ForceOwnerBodyRebuild ON REMOTES
+
+     After Apply, coalesced Force re-pasted whole body (mask 255 or multi-slot
+
+     24|32|96|192|3|6) WITHOUT tint → wiped the composite observer sees.
+
+
+
+  3) GUID KEY MISMATCH (the subtle killer)
+
+     Lua PUSH/NoteEquip stores equip snap under guid from addon string.
+
+     RenderPrep/Force sets prepOwner from unit lookup — SAME player but
+
+     different 64-bit guid high bits (ownerLow matches, full key does not).
+
+     EquipSnapKnown/EquipSnapEntry used EXACT map find (no GuidSamePlayer).
+
+     TrySlotHslForOwner already had GuidSamePlayer fallback; EquipSnap did NOT.
+
+     Result: orphan tint could work (iterates g_remoteTints keys) but Force
+
+     rebuild pasted chest with owner=166 yet a=0 → untinted re-paste → corruption.
+
+
+
+THE FIX THAT WORKED (runId=no-remote-force, GearRecolor.cpp)
+
+
+
+  A) CanonicalTintOwner() — resolve to Lua/PUSH map key via GuidSamePlayer
+
+  B) EquipSnapKnown/EquipSnapEntry — GuidSamePlayer fallback
+
+  C) Remotes NEVER ForceOwnerBodyRebuild — only OrRemotePendingMask +
+
+     natural RenderPrep + SetComponentSectionDirty on pending
+
+  D) ResolveOrphanPasteOwner when TryHsl fails — tint paste without RenderPrep
+
+  E) FlushCoalescedOwnerRebuild — Force rebuild SELF only
+
+
+
+VERIFIED: User confirmed observer tint works after Phase 4 deploy.
+
+
+
+Files: WarcraftXL/wxl-core/scripts/wxl-gear-recolor/src/GearRecolor.cpp
+
+Log runId: no-remote-force in debug-615e3b.log
+
+
+
+======================================================================
+
+OPEN — Partial slot coverage (arms/gloves/feet)  [2026-07-29]
+
+======================================================================
+
+
+
+User report AFTER observer fix:
+
+  Chest tint → torso only, not sleeves/forearms on same chest piece
+
+  Gloves tint → hand (glove_ha) only, not glove_al on forearms
+
+  Feet tint → boot_fo only, not boot_ll (leg lower / knees down)
+
+
+
+Cause: MatchComponentTextureForOwner used CandidateEquipSlotsForComponent
+
+  which maps comp 0,1 → slot 8 only, comp 6 → slot 6 only, etc.
+
+  Chest item DisplayInfo ALSO contains sleeve/bracer stems → must match
+
+  slot 4 tint via PathMatchesSlotComponent on ALL tinted slots.
+
+
+
+Fix Phase 5 (component-stems):
+
+  - MatchComponentTextureForOwner: scan all tinted slots for display stem
+
+  - SectionMaskForEquipSlot(3/4): dirty sections 0,1,3,4 not just 3,4
+
+  - ComponentIndexFromTexturePath: recognize sleeve/bracer/boot_ll filenames
+
+
+
+======================================================================
+
+PHASE HISTORY (abbreviated)
+
+======================================================================
+
+  Phase 1: Static RE Wow.exe — RenderPrep singleton vs pool
+
+  Phase 2: Runtime probe — CharComponent OK, paste timing bad
+
+  Phase 3: orphan-fix — orphan tint helped, Force still broke
+
+  Phase 4: no-remote-force — **SOLVED observer bug**
+
+  Phase 5: component-stems — partial slot coverage fix
+
+
+
+======================================================================
+
+FILE INDEX
+
+======================================================================
+
+  WXL-REMOTE-RECOLOR-SESSION.txt     — this file
+
+  WXL-REMOTE-RECOLOR-RE-FINDINGS.txt — static RE
+
+  debug-615e3b.log
+
+

@@ -1,0 +1,42 @@
+WXL RE — documento vivo
+========================
+Ultimo update: 2026-07-31
+
+## DOCUMENTO PRINCIPALE
+→ WXL-RE-COMPLETE-MAP.txt  (612 righe — mappa più completa finora)
+→ WXL-RE-MODEL-ISOLATION-MAP.txt (regole R1-R7)
+
+## ONESTO: cosa NON sappiamo ancora (blocca il fix)
+1. Layout CompositeMipObject — dove sono i pixel CPU (+offset)
+2. Quale slot [comp+0x34] ring è quello mostrato al GPU
+3. Se TextureCacheHelper restituisce lo stesso ptr per unità diverse
+4. Chi setta dirty=0x3FF sui remote al PUSH server (lato client, non nostro codice)
+
+Senza questi 4 punti, ogni patch è ancora a tentativi.
+
+## Cosa SA il client (static RE verificato)
+- Identity: unit+0xB4 == comp+0x38
+- Self: *[B6B1A0], Remote: pool *[B6B240] stride 0x198
+- Scratch GLOBALE: *[B6B870] — un solo buffer gear per tutto il client
+- Pipeline: RenderPrep → RenderPrepSections → handler sec → FlushGearComposite
+- Sec8 @ 0x4F0AD0: skin → [+0x1A4/+0x1B0], poi paste DA B6B870
+- Flush @ 0x4E9000 tocca ANCHE mip faccia (+0x1A4/+0x1B0)
+
+## Log ultimo test (debug-615e3b.log)
+- 2823 pass remote RenderPrep
+- pasteStrictOk=0: 2762 | =1023: solo 12
+- face_done: 374 | face_skin_ok: 98
+- Il problema NON è solo dirty 0x3FF — la maggior parte dei remote
+  entra con dirty=0; il bleed è altrove (scratch/mip pool/cache condivisi)
+
+## Fix v9/v9b — insufficienti (confermato utente "fatto")
+Non toccare codice finché non chiudiamo gap J in COMPLETE-MAP.
+
+## Prossimo passo: RUNTIME PROBE attivo (v10)
+DLL logga in debug-615e3b.log con runId=rt-re:
+  prep_self / prep_remote — dirty, mipIdx, ptr +0x194/+0x1A4/+0x1B0
+  gear_scratch — hash pixeli in B6B870 dopo paste gear
+  face_scratch — hash B6B870 quando faccia lo legge
+  flush — mipIdx ring + hash scratch al flush
+
+Analisi: python DBC_Tool/wxl_analyze_rt_re.py

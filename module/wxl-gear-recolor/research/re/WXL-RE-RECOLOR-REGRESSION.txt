@@ -1,0 +1,123 @@
+WXL RE — Regressione /recolor (login OK → recolor broken)
+==========================================================
+Data: 2026-07-31 | Log: debug-615e3b.log (13951 eventi JSON)
+
+## Sintomo utente
+- Login / apertura mondo: 3/3 facce corrette
+- Dopo /recolor (anche senza apply): facce buggate (self nera, remote texture altrui)
+
+## Split temporale log
+
+| Fase | Eventi | face_skin_ok | face ptr multi-race | self_face_done | remote_miss |
+|------|--------|--------------|---------------------|----------------|-------------|
+| PRE (login) | 42 | 10 | **3** (stessa race) | 0 | 0 |
+| POST (/recolor) | 13909 | 764 | **55** (Orc+BElf+…) | 125 | 1032 |
+
+Boundary ts ≈ 2690437671 (primo remote_snap burst da PUSH addon).
+
+## Perché il login funziona (RE + log)
+
+1. **RenderPrep nativo per player**: dirty mask spesso **0x3FF** (tutte le sezioni).
+   Handler 0-9 girano in sequenza nello stesso pass.
+2. **Faccia e gear nello stesso atomic pass** → niente stato intermedio
+   gear-tinted in scratch mentre faccia non è ripastata.
+3. **Poche collisioni mip**: stesso `dstMips` ptr solo per face+hair stessa race
+   (es. BloodElfFemaleFaceUpper + ScalpUpper sullo stesso component).
+
+## Cosa cambia dopo /recolor (evidenza log)
+
+### 1. Tempesta PUSH → tint → RenderPrep interleaved
+- remote_snap ×876, remote_set ×874, stem_tint ×926
+- hkRenderPrep remote ×8556 con `pasteStrictOk` alternato **0 / 1023 / 255**
+- Stesso owner, **componenti diversi** nello stesso frame:
+  - owner 166: comp 595630008, 596416344, 789411648, …
+  - owner 263: comp 595628680, 789411648, …
+  → Il client ha **più CharComponent per lo stesso body model** (pool slot vs live).
+
+### 2. Singleton scratch `*[0x00B6B870]` — 30 code ref nel .text
+Gear sezioni 0-7: tutti i paste vanno nello scratch globale.
+Handler sezione 8 @ 0x4F0AD0 (dual-path, vedi WXL-RE-SECT8-DUAL-PATH.txt):
+
+```
+TextureCacheHelper
+jz skip_layout                    ; spesso salta PasteSkinLayout
+PasteSkinLayout(8) → B6B870       ; layout path
+PasteFromSkin(8): B6B870 → [esi+0x1A4]   ; SCRATCH → face mip
+PasteFromSkin(8): B6B870 → [esi+0x1B0]
+```
+
+Se il layout path usa scratch **dopo** un gear tint di un altro player
+(senza serializzazione completa), la faccia riceve pixel gear tintati.
+
+### 3. FlushGearComposite @ 0x4E9000 (disasm WXL-RE-MIP-POOL.txt)
+Chiamato a fine RenderPrep. Tocca **sempre**:
+- `[esi+0x194]`, `[esi+0x1A4]`, `[esi+0x1B0]` via `call 0x4F2CE0`
+- Pool refcount su `[esi+0x34]` (array di mip slot)
+
+**Anche quando dirty mask = solo 0-7** (gear tint):
+- Handler 8-9 **non** dispatchati
+- FlushGearComposite **invalida/swap** mip faccia nel pool comunque
+- Faccia non ripastata → nera o stale
+
+### 4. self_face_done ×125 NON risolve
+Il fix WXL (face-only RenderPrep 0x300 dopo ogni gear pass) **gira** ma:
+- `self_gear_only` = 125 = stesso conteggio → correlato 1:1
+- Utente vede ancora faccia nera
+
+Ipotesi RE (da verificare con breakpoint):
+- **A)** `RunSelfFaceRebuildNow` usa `component` del pass gear, ma il renderer
+  mostra un **altro** CharComponent del pool (stesso model, comp diverso nel log).
+- **B)** Face repaste scrive su mip pool slot che FlushGearComposite ha già
+  swappato via `[esi+0x34]` — il display legge slot diverso da quello ripastato.
+- **C)** Layout path su faccia legge ancora B6B870 contaminato tra gear remote
+  interleaved (collisioni 3→55 multi-race).
+
+### 5. remote_miss ×1032
+`allowed=0` + `hasRemoteTint` + spesso `pasteStrictOk=1023`.
+Native vuole full rebuild; WXL nega tint ma **CallOrig gira comunque**
+senza `g_tlsPasteOwner` → assemble nativo senza isolamento owner.
+
+## Architettura client (sintesi per fix futuro)
+
+```
+                    ┌─────────────────────────────────┐
+  RenderPrep        │  dirty [edi+0x0C] bit mask      │
+  @ 0x4F1520        │  0-7: gear handlers → B6B870    │
+                    │  8-9: face handlers → +0x1A4/b0 │
+                    └──────────────┬──────────────────┘
+                                   │
+                    ┌──────────────▼──────────────────┐
+                    │  FlushGearComposite @ 0x4E9000  │
+                    │  RefCount/swap ALL mip fields   │
+                    │  incl. face anche se 8-9 clean  │
+                    └─────────────────────────────────┘
+
+  B6B870 = UNICO scratch client-wide (non per-player)
+  +0x1A4/+0x1B0 = per-component ma backed by shared mip POOL [esi+0x34]
+```
+
+## Cosa NON fare (già provato, crash/bleed)
+- OR dirty 0x300 inside nested gear RenderPrep
+- face_gear_block su sec 8-9
+- double FlushGearComposite forzato
+- ScheduleOwnerSectionRebuild ogni frame
+- face_dirty_or inside nested prep
+
+## Prossimi passi RE (disassemble, non patch random)
+
+1. **0x4F2CE0** — funzione mip pool swap (chiamata da FlushGearComposite)
+   - Mappare relazione [esi+0x34] array ↔ quale slot è “displayed”
+2. **CharComponent pool @ 0xB6B240** — chi alloca, quando comp viene riciclato
+   - Refs: 0x4E6AE0, 0x4E291C, …
+3. **Breakpoint runtime**: PasteFromSkin(8) con src=B6B870
+   - Log owner + hash primi 16 byte scratch vs face tex attesa
+4. **Instrumentazione minima** (solo log, no behavior):
+   - `self_face_done`: log `comp`, `g_localPlayerComponent`, `poolIndex`,
+     `[comp+0x1A4]` ptr, `[comp+0x34]` pool cursor
+   - Confronto comp gear-pass vs comp face-pass stesso frame
+
+## File RE correlati
+- WXL-RE-SECT8-DUAL-PATH.txt — handler faccia dual-path
+- WXL-RE-MIP-POOL.txt — FlushGearComposite + pool
+- WXL-RE-FACE-ROOT-CAUSE.txt — gear dirty 0-7 vs face 8-9
+- WXL-LOG-RECOLOR-REGRESSION.txt — stats automatiche

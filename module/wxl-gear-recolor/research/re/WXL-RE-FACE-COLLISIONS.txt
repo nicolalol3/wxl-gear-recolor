@@ -1,0 +1,217 @@
+Face dst ptr collision report — C:\Azerothcore\debug-615e3b.log
+Total face_skin_ok ptrs: 57
+Multi-race collisions: 41
+
+ptr=0x20C85810 n=36 races=['be', 'other']
+  2691922703 BloodElfFemaleFaceUpper07_08.blp
+  2691922703 ScalpUpperHair00_00.blp
+  2691922703 BloodElfFemaleFaceLower07_08.blp
+  2691922703 ScalpLowerHair00_00.blp
+  2691944625 BloodElfFemaleFaceUpper07_08.blp
+  2691944625 ScalpUpperHair00_00.blp
+  2691944625 BloodElfFemaleFaceLower07_08.blp
+  2691944625 ScalpLowerHair00_00.blp
+
+ptr=0x20BA81C0 n=24 races=['orc', 'other']
+  2691923406 OrcFemaleFaceUpper06_00.blp
+  2691923406 ScalpUpperHair00_02.blp
+  2691923406 OrcFemaleFaceLower06_00.blp
+  2691923406 ScalpLowerHair00_02.blp
+  2691946343 OrcFemaleFaceUpper06_00.blp
+  2691946343 ScalpUpperHair00_02.blp
+  2691946343 OrcFemaleFaceLower06_00.blp
+  2691946343 ScalpLowerHair00_02.blp
+
+ptr=0x20D4A0D0 n=8 races=['be', 'orc', 'other']
+  2690438859 BloodElfFemaleFaceUpper07_08.blp
+  2690438859 ScalpUpperHair00_00.blp
+  2690438859 BloodElfFemaleFaceLower07_08.blp
+  2690438859 ScalpLowerHair00_00.blp
+  2690438937 OrcFemaleFaceUpper06_00.blp
+  2690438937 ScalpUpperHair00_02.blp
+  2690438937 OrcFemaleFaceLower06_00.blp
+  2690438937 ScalpLowerHair00_02.blp
+
+ptr=0x20D48EE8 n=8 races=['be', 'orc', 'other']
+  2690604500 BloodElfFemaleFaceUpper07_08.blp
+  2690604500 ScalpUpperHair00_00.blp
+  2690604500 BloodElfFemaleFaceLower07_08.blp
+  2690604500 ScalpLowerHair00_00.blp
+  2690604656 OrcFemaleFaceUpper06_00.blp
+  2690604656 ScalpUpperHair00_02.blp
+  2690604656 OrcFemaleFaceLower06_00.blp
+  2690604656 ScalpLowerHair00_02.blp
+
+ptr=0x20D29F78 n=8 races=['be', 'orc', 'other']
+  2691352156 BloodElfFemaleFaceUpper07_08.blp
+  2691352156 ScalpUpperHair00_00.blp
+  2691352156 BloodElfFemaleFaceLower07_08.blp
+  2691352156 ScalpLowerHair00_00.blp
+  2691352203 OrcFemaleFaceUpper06_00.blp
+  2691352203 ScalpUpperHair00_02.blp
+  2691352203 OrcFemaleFaceLower06_00.blp
+  2691352203 ScalpLowerHair00_02.blp
+
+ptr=0x20D59F78 n=8 races=['be', 'orc', 'other']
+  2691717031 BloodElfFemaleFaceUpper07_08.blp
+  2691717031 ScalpUpperHair00_00.blp
+  2691717031 BloodElfFemaleFaceLower07_08.blp
+  2691717031 ScalpLowerHair00_00.blp
+  2691717109 OrcFemaleFaceUpper06_00.blp
+  2691717109 ScalpUpperHair00_02.blp
+  2691717109 OrcFemaleFaceLower06_00.blp
+  2691717109 ScalpLowerHair00_02.blp
+
+ptr=0x238B3870 n=8 races=['orc', 'other']
+  2692327671 OrcFemaleFaceUpper06_00.blp
+  2692327671 ScalpUpperHair00_02.blp
+  2692327671 OrcFemaleFaceLower06_00.blp
+  2692327671 ScalpLowerHair00_02.blp
+  2692327812 OrcFemaleFaceUpper06_00.blp
+  2692327812 ScalpUpperHair00_02.blp
+  2692327812 OrcFemaleFaceLower06_00.blp
+  2692327812 ScalpLowerHair00_02.blp
+
+ptr=0x20D6A908 n=6 races=['be', 'orc', 'other']
+  2690604796 OrcMaleFaceUpper00_00.blp
+  2690604796 OrcMaleFaceLower00_00.blp
+  2690604812 BloodElfFemaleFaceUpper07_08.blp
+  2690604812 ScalpUpperHair00_00.blp
+  2690604812 BloodElfFemaleFaceLower07_08.blp
+  2690604812 ScalpLowerHair00_00.blp
+
+ptr=0x20D6D8C0 n=6 races=['orc', 'other']
+  2691616265 OrcFemaleFaceUpper06_00.blp
+  2691616265 ScalpUpperHair00_02.blp
+  2691616265 OrcFemaleFaceLower06_00.blp
+  2691616265 ScalpLowerHair00_02.blp
+  2691627718 OrcMaleFaceUpper00_00.blp
+  2691627718 OrcMaleFaceLower00_00.blp
+
+ptr=0x20CEA660 n=6 races=['be', 'orc', 'other']
+  2692327765 OrcMaleFaceUpper00_00.blp
+  2692327765 OrcMaleFaceLower00_00.blp
+  2692327828 BloodElfFemaleFaceUpper07_08.blp
+  2692327828 ScalpUpperHair00_00.blp
+  2692327828 BloodElfFemaleFaceLower07_08.blp
+  2692327828 ScalpLowerHair00_00.blp
+
+ptr=0x20CC4940 n=4 races=['be', 'other']
+  2690433109 BloodElfFemaleFaceUpper07_08.blp
+  2690433109 ScalpUpperHair00_00.blp
+  2690433109 BloodElfFemaleFaceLower07_08.blp
+  2690433109 ScalpLowerHair00_00.blp
+
+ptr=0x20E62938 n=4 races=['orc', 'other']
+  2690435343 OrcFemaleFaceUpper06_00.blp
+  2690435343 ScalpUpperHair00_02.blp
+  2690435343 OrcFemaleFaceLower06_00.blp
+  2690435343 ScalpLowerHair00_02.blp
+
+ptr=0x20EC29C0 n=4 races=['be', 'other']
+  2690438093 BloodElfFemaleFaceUpper07_08.blp
+  2690438093 ScalpUpperHair00_00.blp
+  2690438093 BloodElfFemaleFaceLower07_08.blp
+  2690438093 ScalpLowerHair00_00.blp
+
+ptr=0x20CD5640 n=4 races=['be', 'other']
+  2690594578 BloodElfFemaleFaceUpper07_08.blp
+  2690594578 ScalpUpperHair00_00.blp
+  2690594578 BloodElfFemaleFaceLower07_08.blp
+  2690594578 ScalpLowerHair00_00.blp
+
+ptr=0x20D0A880 n=4 races=['orc', 'other']
+  2690599562 OrcFemaleFaceUpper06_00.blp
+  2690599562 ScalpUpperHair00_02.blp
+  2690599562 OrcFemaleFaceLower06_00.blp
+  2690599562 ScalpLowerHair00_02.blp
+
+ptr=0x20CBEA30 n=4 races=['be', 'other']
+  2690952171 BloodElfFemaleFaceUpper07_08.blp
+  2690952171 ScalpUpperHair00_00.blp
+  2690952171 BloodElfFemaleFaceLower07_08.blp
+  2690952171 ScalpLowerHair00_00.blp
+
+ptr=0x20CD0A70 n=4 races=['orc', 'other']
+  2690959609 OrcFemaleFaceUpper06_00.blp
+  2690959609 ScalpUpperHair00_02.blp
+  2690959609 OrcFemaleFaceLower06_00.blp
+  2690959609 ScalpLowerHair00_02.blp
+
+ptr=0x20CA2B38 n=4 races=['be', 'other']
+  2691259843 BloodElfFemaleFaceUpper07_08.blp
+  2691259843 ScalpUpperHair00_00.blp
+  2691259843 BloodElfFemaleFaceLower07_08.blp
+  2691259843 ScalpLowerHair00_00.blp
+
+ptr=0x20CCB078 n=4 races=['orc', 'other']
+  2691265703 OrcFemaleFaceUpper06_00.blp
+  2691265703 ScalpUpperHair00_02.blp
+  2691265703 OrcFemaleFaceLower06_00.blp
+  2691265703 ScalpLowerHair00_02.blp
+
+ptr=0x20CE89E0 n=4 races=['be', 'other']
+  2691343781 BloodElfFemaleFaceUpper07_08.blp
+  2691343781 ScalpUpperHair00_00.blp
+  2691343781 BloodElfFemaleFaceLower07_08.blp
+  2691343781 ScalpLowerHair00_00.blp
+
+ptr=0x20D80B30 n=4 races=['orc', 'other']
+  2691348890 OrcFemaleFaceUpper06_00.blp
+  2691348890 ScalpUpperHair00_02.blp
+  2691348890 OrcFemaleFaceLower06_00.blp
+  2691348890 ScalpLowerHair00_02.blp
+
+ptr=0x20DE0BB8 n=4 races=['be', 'other']
+  2691351937 BloodElfFemaleFaceUpper07_08.blp
+  2691351937 ScalpUpperHair00_00.blp
+  2691351937 BloodElfFemaleFaceLower07_08.blp
+  2691351937 ScalpLowerHair00_00.blp
+
+ptr=0x20D48A68 n=4 races=['orc', 'other']
+  2691351953 OrcFemaleFaceUpper06_00.blp
+  2691351953 ScalpUpperHair00_02.blp
+  2691351953 OrcFemaleFaceLower06_00.blp
+  2691351953 ScalpLowerHair00_02.blp
+
+ptr=0x20DADA08 n=4 races=['be', 'other']
+  2691613968 BloodElfFemaleFaceUpper07_08.blp
+  2691613968 ScalpUpperHair00_00.blp
+  2691613968 BloodElfFemaleFaceLower07_08.blp
+  2691613968 ScalpLowerHair00_00.blp
+
+ptr=0x20CD9ED8 n=4 races=['orc', 'other']
+  2691624828 OrcFemaleFaceUpper06_00.blp
+  2691624828 ScalpUpperHair00_02.blp
+  2691624828 OrcFemaleFaceLower06_00.blp
+  2691624828 ScalpLowerHair00_02.blp
+
+ptr=0x20CB29C8 n=4 races=['be', 'other']
+  2691707875 BloodElfFemaleFaceUpper07_08.blp
+  2691707875 ScalpUpperHair00_00.blp
+  2691707875 BloodElfFemaleFaceLower07_08.blp
+  2691707875 ScalpLowerHair00_00.blp
+
+ptr=0x20C98E60 n=4 races=['orc', 'other']
+  2691713921 OrcFemaleFaceUpper06_00.blp
+  2691713921 ScalpUpperHair00_02.blp
+  2691713921 OrcFemaleFaceLower06_00.blp
+  2691713921 ScalpLowerHair00_02.blp
+
+ptr=0x20CF8EE8 n=4 races=['be', 'other']
+  2691716765 BloodElfFemaleFaceUpper07_08.blp
+  2691716765 ScalpUpperHair00_00.blp
+  2691716765 BloodElfFemaleFaceLower07_08.blp
+  2691716765 ScalpLowerHair00_00.blp
+
+ptr=0x20D3B058 n=4 races=['be', 'other']
+  2691912859 BloodElfFemaleFaceUpper07_08.blp
+  2691912859 ScalpUpperHair00_00.blp
+  2691912859 BloodElfFemaleFaceLower07_08.blp
+  2691912859 ScalpLowerHair00_00.blp
+
+ptr=0x20C5DA08 n=4 races=['orc', 'other']
+  2691915953 OrcFemaleFaceUpper06_00.blp
+  2691915953 ScalpUpperHair00_02.blp
+  2691915953 OrcFemaleFaceLower06_00.blp
+  2691915953 ScalpLowerHair00_02.blp

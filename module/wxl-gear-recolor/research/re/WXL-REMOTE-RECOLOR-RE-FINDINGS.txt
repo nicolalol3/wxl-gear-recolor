@@ -1,0 +1,108 @@
+WXL Remote Recolor — RE Findings (Wow.exe 3.3.5a static scan)
+================================================================
+Date: 2026-07-29
+Tool: DBC_Tool/wxl_re_scan.py on client Wow.exe
+Full raw output: DBC_Tool/WXL-RE-SCAN-OUTPUT.txt
+
+CONCLUSION (why self works, remote breaks)
+------------------------------------------
+The client does NOT use one unified "player body" path:
+
+1. LOCAL PLAYER uses a SINGLETON CharComponent at global 0x00B6B1A0.
+   Call site 0x004DFC98 / 0x004E150F:
+     mov ecx, [0x00B6B1A0]
+     push 0
+     call CCharacterComponent::RenderPrep (0x4F1520)
+
+2. OTHER UNITS use a POOL of CharComponents at global 0x00B6B240,
+   stride 0x198 (408 bytes) per entry.
+   Call site 0x004E2FF8:
+     mov ecx, [0x00B6B240]
+     imul eax, 0x198
+     ... load component from array ...
+     push 0
+     mov ecx, eax
+     call RenderPrep
+
+3. Our hook treats "allowed remote" only when BodyModelOwnerGuid(model)
+   AND OwnerHasAnyRemoteTint — but FindVerifiedOwnerComponent / IsPasteTintAllowed
+   require ComponentModel(component) == unit+0xB4 EXACTLY.
+
+   Static RenderPrep body reads model from [component+0x38] — if pool entries
+   point at a sub-model under unit+0xB4 (not the root), our strict equality
+   fails → ForceOwnerBodyRebuild can't find component → paste runs with
+   prepOwner=0 (logs: remote_no_hsl, ownerLow:0).
+
+4. Force rebuild path pushes a2=1 (seen at 0x004E6B9A, 0x00528085, 0x0052FDAC).
+   Natural local singleton path pushes a2=0.
+
+CCharacterComponent::RenderPrep @ 0x004F1520 — CONFIRMED LAYOUT
+---------------------------------------------------------------
+Prologue (thiscall, retn 4 — one stack arg a2):
+
+  +0x08  byte flags — bit 0x04 early-outs NPC-ish path
+  +0x0C  uint32 section dirty mask (COMPONENT_SECTIONS)
+  +0x38  void* model (M2 instance / scene node used for paste)
+  +0x3C  uint32 flags — bit 0 = NPC (test [esi+3C], 1 → early ret)
+
+Early NPC exit returns 1 without assembling.
+Main path calls sub_4ED900 then RenderPrepSections @ 0x4EE0D0 when dirty.
+
+Paste call graph (unchanged offsets, re-verified)
+-------------------------------------------------
+  PasteSkinLayout  0x4F07D0 — 11 callers (base skin, NEVER tint)
+  PasteFromSkin    0x4F08A0 — 17 callers (item TextureComponents — OUR hook)
+  TextureCacheCreate 0x4F3930
+  RenderPrepSections 0x4EE0D0 — called from RenderPrep @ 0x4F14CC
+
+RenderPrep callers (13 total)
+-----------------------------
+  0x004DFC98  singleton [B6B1A0], a2=0  — likely local / UI primary
+  0x004E150F  singleton [B6B1A0], a2=0
+  0x004E2FF8  pool [B6B240], stride 198, a2=0  — **world unit batch**
+  0x004E6B9A  ecx=esi (in-loop), a2=1  — force dirty rebuild
+  0x00528085  a2=1
+  0x0052FDAC  a2=1
+  0x005972AB  a2=0
+  0x00597F55  ...
+  0x00616B5B  ...
+  0x006D2924  ...
+  0x00705824  ...
+  0x007058DF  ...
+  0x00730F89  ...
+
+NEW GLOBALS TO TRACK AT RUNTIME
+-------------------------------
+  0x00B6B1A0  g_LocalCharComponent*   (singleton — self path)
+  0x00B6B240  g_CharComponentPool*    (array base — remote path)
+  stride 0x198 per pool slot
+
+RUNTIME PROBE (deployed in GearRecolor.cpp, runId=re-probe)
+-----------------------------------------------------------
+Logs per hkRenderPrep (no behavior change):
+  comp, model, unitRoot, modelEqRoot, underRoot, verifiedComp,
+  isSingleton (comp == *[B6B1A0]), poolIndex (offset/198 from *[B6B240]),
+  a2, allowed, reason
+
+Expected if hypothesis correct:
+  SELF:  isSingleton=1, modelEqRoot=1, pasteStrictOk=1, allowed=local
+  REMOTE with tint: isSingleton=0, poolIndex>=0, modelEqRoot MAY BE 0,
+                    underRoot=1, verifiedComp=0, allowed=0 or remote_miss
+
+NEXT RE TASKS (before any more tint heuristics)
+-----------------------------------------------
+1. Run two-client test → collect debug-615e3b.log lines hypothesisId=RE
+2. Map pool index → unit GUID (scan pool entry for guid or CMO back-ptr)
+3. Disassemble 0x004E2FF8 caller frame — who sets pool count, when?
+4. Find field in 408-byte CharComponent struct linking to CGUnit / CMO
+   (likely near +0x38 model or separate +0x?? owner field)
+5. Fix remote path ONLY after RE confirms:
+   - Which component pointer to dirty for a given remote GUID
+   - Whether paste allow should use underRoot not strict equality
+   - Whether remotes need pool-index lookup instead of unit+0xB4 mapping
+
+DO NOT (user directive)
+-----------------------
+- Port archive GearRecolor as "the fix"
+- Add more PUSH / NoteEquip / Force rebuild patches without RE proof
+- Tint on shared TextureCache without per-owner assembly identity

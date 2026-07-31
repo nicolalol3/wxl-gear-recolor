@@ -1,0 +1,61 @@
+WXL gear-recolor — CharComponent composite RE (Wow 3.3.5a)
+==========================================================
+Date: 2026-07-30
+Tool: DBC_Tool/wxl_re_paste_composite.py
+Full dump: DBC_Tool/WXL-RE-PASTE-COMPOSITE.txt
+
+PASTE DESTINATION BY SECTION
+----------------------------
+Sections 0-7 (gear TextureComponents):
+  dst = *[0x00B6B870]  (global scratch — SHARED across all units)
+  Pattern at callers 0x4F09D0, 0x4F0A05, etc.:
+    mov eax/ecx, [0x00B6B870]
+    push section
+    call PasteFromSkin @ 0x4F08A0
+
+Sections 8-9 (face/hair layers):
+  dst = per-component field on esi (CharComponent*):
+    section 8: [esi+0x1A4], [esi+0x1B0], fallback [esi+0x194] path
+    section 9: [esi+0x1A0], [esi+0x1AC], [esi+0x1BC]
+  See caller cluster @ 0x4F0AF0..0x4F0C00
+
+POST-PASTE FLUSH (gear → component mips)
+---------------------------------------
+CharFlushGearComposite @ 0x004E9000 (thiscall, esi=component):
+  mov eax, [0x00B6B864]
+  call TextureCache helper @ 0x4F3BA0
+  mov eax, [esi+0x194]  → call RefCountMip @ 0x4F2CE0
+  mov eax, [esi+0x1A4]  → call 0x4F2CE0
+  mov eax, [esi+0x1B0]  → call 0x4F2CE0
+  mov eax, [esi+0x1C0]  → call 0x4F2CE0
+
+RefCountMip @ 0x4F2CE0: inc dword [eax+0xA4] (mip object refcount)
+
+CharComponent composite mip pointer fields:
+  +0x194  gear composite slot 0
+  +0x1A4  gear composite slot 1 / section 8
+  +0x1B0  gear composite slot 2 / section 8 alt
+  +0x1C0  gear composite slot 3
+  +0x1A0  section 9
+  +0x1AC  section 9 alt
+  +0x1BC  section 9 alt
+  +0x52C  used in section 8-9 flush path (edi temp)
+
+RenderPrepSections @ 0x4EE0D0:
+  Uses dispatch table @ 0x00B6B88C, [edi+0x190] section handler ptr
+  Called from RenderPrep @ 0x4F14CC with ecx=component
+
+IMPLICATION FOR WXL
+-------------------
+1. Tint at paste into *[B6B870] MUST know which CharComponent* is assembling.
+2. Flush @ 0x4E9000 is the bind point: esi=component, global scratch already
+   contains pasted pixels — hook installed to register component→owner.
+3. Next RE: who calls 0x4E9000 (indirect?), memcpy from B6B870 into mip objs.
+4. Layer 4 goal: per-(component,section) pixel snapshot if interleaved flush.
+
+WXL HOOKS DEPLOYED
+------------------
+  hkRenderPrep       @ 0x4F1520
+  hkPasteFromSkin    @ 0x4F08A0
+  hkFlushGearComposite @ 0x4E9000  (NEW)
+  g_tlsPasteOwner during CallOrigRenderPrepSeh

@@ -1,0 +1,124 @@
+WXL gear-recolor — RE roadmap (player / face / gear assemble)
+=============================================================
+Date: 2026-07-31
+Status: ACTIVE — stop hook guessing until phases 1-3 are documented.
+
+WHY WE ARE HERE
+---------------
+Runtime logs proved:
+  - face_skin_ok runs at char select (ownerLow=0) but NOT during in-world local
+    RenderPrep with gear tint.
+  - skin_layout (PasteSkinLayout hook) never fires in-world in recent logs.
+  - Remotes look OK because native_first assemble runs face before gear tint.
+  - Local self tints gear immediately → face mips never rebuilt → black face.
+  - local_face_refresh (second RenderPrep) → invisible player (composite destroyed).
+
+Root issue is NOT "missing one if-statement" — we do not fully understand the
+client's section dispatch, scratch lifetime, and local-vs-remote CharComponent
+paths. More RE before more hooks.
+
+TOOLS
+-----
+  DBC_Tool/wxl_re_paste_composite.py     — paste/flush basics (imm32 scan BUGGY)
+  DBC_Tool/wxl_re_scan.py                — call graph landmarks
+  DBC_Tool/wxl_re_char_assemble_master.py — NEW master dump (fixed imm32 scan)
+  Output: WXL-RE-CHAR-ASSEMBLE-MASTER.txt
+
+  Interactive (user): x64dbg / Cheat Engine on Wow.exe 3.3.5a
+  Breakpoints from RE doc below.
+
+PHASE 1 — STATIC MAP (no hooks)
+-------------------------------
+Goal: complete call graph + global xref for assemble pipeline.
+
+[ ] 1.1  Fix + run wxl_re_char_assemble_master.py → MASTER.txt
+[ ] 1.2  Document every caller of RenderPrep @ 0x4F1520
+[ ] 1.3  Document every caller of FlushGearComposite @ 0x4E9000
+[ ] 1.4  Full disasm RenderPrepSections @ 0x4EE0D0 + table @ 0x00B6B88C
+[ ] 1.5  Map ALL B6B870 refs (expect 50+, old script reported 0 incorrectly)
+[ ] 1.6  Find rep movsd/memcpy from B6B870 → CharComponent mip fields
+[ ] 1.7  CharComponent struct draft: all [esi+off] in 0x4E0000..0x520000
+
+Deliverable: WXL-RE-CHARCOMPONENT-STRUCT.txt
+
+PHASE 2 — SECTION DISPATCH (face vs gear)
+----------------------------------------
+Goal: understand sections 0-9 as the CLIENT defines them.
+
+Known (partial):
+  0-7  gear TextureComponents → dst = *[B6B870] scratch (SHARED)
+  8-9  face/hair → dst = per-component [esi+0x1A4, 0x1B0, 0x1A0, ...]
+  Face path cluster @ 0x4F0AF0: PasteSkinLayout(8) → PasteFromSkin(scratch→face)
+
+[ ] 2.1  For each section 0..9: which function builds dirty bit? (+0x0C mask)
+[ ] 2.2  Trace RenderPrep when a2=1 (enter world) vs a2=0 (update) — same face path?
+[ ] 2.3  Does local self use g_LocalCharComponent @ B6B1A0 exclusively?
+[ ] 2.4  Pool @ B6B240 stride 0x198 — how is slot chosen for remote units?
+[ ] 2.5  When is PasteSkinLayout(8|9) called vs direct face texture paste?
+[ ] 2.6  What does FlushGearComposite actually do to +0x1A4 face mips?
+
+Deliverable: WXL-RE-SECTION-DISPATCH.txt with table:
+
+  section | dirty bit | paste dst        | layout fn      | flush target
+  --------|-----------|------------------|----------------|-------------
+
+PHASE 3 — RUNTIME TRACE (interactive RE)
+----------------------------------------
+Goal: one controlled repro with breakpoints, 1 client, no WXL hooks.
+
+Setup:
+  1. Vanilla Wow.exe (no WarcraftXL.dll) OR minimal logging only
+  2. One character with visible gear, enter world
+  3. Break on RenderPrep (0x4F1520), log ecx=CharComponent*, [ecx+0x0C] dirty
+
+Breakpoints (priority order):
+  BP1  0x004F1520  RenderPrep entry — ecx, [ecx+0x0C], [ecx+0x3C] model
+  BP2  0x004EE0D0  RenderPrepSections — which sections run
+  BP3  0x004F07D0  PasteSkinLayout — section arg, dst ptr vs B6B870
+  BP4  0x004F08A0  PasteFromSkin — section, src, dst (face vs scratch)
+  BP5  0x004E9000  FlushGearComposite — which [esi+off] mips touched
+
+Log per hit:
+  - CharComponent*
+  - section index (stack)
+  - src texture name (if available via TextureCache)
+  - dst == *[B6B870] ? 
+  - dirty mask before/after
+
+Deliverable: WXL-RE-RUNTIME-TRACE.txt
+
+PHASE 4 — WXL FIX (only after phase 3)
+-------------------------------------
+Allowed fixes (evidence-based only):
+
+  A) Per-owner scratch snapshot at FlushGearComposite (Layer 4 from infra plan)
+  B) Tint only inside verified AssembleSession + correct section dst
+  C) Local self: mirror remote native_first IF runtime trace confirms face skipped
+  D) Draw-time tint fallback (last resort)
+
+Forbidden until documented:
+  - Blocking PasteFromSkin returns without RE proof
+  - Second RenderPrep / ForceOwner on face sections
+  - dstOk / orphan / stem guessing on face sections 8-9
+
+CURRENT OFFSETS (verify in phase 1)
+-------------------------------------
+  RenderPrep              0x004F1520
+  RenderPrepSections      0x004EE0D0
+  PasteSkinLayout         0x004F07D0
+  PasteFromSkin           0x004F08A0
+  FlushGearComposite      0x004E9000
+  RefCountCompositeMip    0x004F2CE0
+  *[B6B870]               global gear scratch mips
+  *[B6B1A0]               local CharComponent singleton
+  *[B6B240]               remote CharComponent pool
+  CharComponent+0x0C      section dirty mask
+  CharComponent+0x38      model ptr
+  CharComponent+0x3C      flags (bit0 = NPC)
+  CharComponent+0x1A4     face mip section 8
+
+NEXT ACTION (user + agent)
+--------------------------
+  1. Agent: run wxl_re_char_assemble_master.py, read MASTER.txt, fill struct draft
+  2. User: optional x64dbg session with BP1-BP5 on vanilla client
+  3. NO new GearRecolor.cpp hook logic until section dispatch table is complete
