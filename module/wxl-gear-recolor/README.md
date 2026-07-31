@@ -29,9 +29,3 @@ composite or face/hair caches.
 ## Opt-out
 
 Create `WarcraftXL_gear-recolor.disable` next to `Wow.exe`.
-
-## Multi-player RE archive (July 2026)
-
-Solo-use module above; multi-client tint research lives in [`research/`](research/)
-(offsets, disasm, hook failures, status). Safe to delete or `git revert` that folder.
-Mirror: https://github.com/nicolalol3/wxl-gear-recolor-research
